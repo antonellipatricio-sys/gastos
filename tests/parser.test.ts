@@ -95,3 +95,36 @@ describe.skipIf(!fs.existsSync(VISA))("resumen Visa real (04-09-2026)", () => {
     expect(g.descripcion).toMatch(/^Sancor coop se\d+/);
   });
 });
+
+const AMEX = path.join(__dirname, "..", "resumenes", "amex.pdf");
+
+describe.skipIf(!fs.existsSync(AMEX))("resumen American Express real (07-09-2026)", () => {
+  let r: Resumen;
+  beforeAll(async () => {
+    r = parsearResumen(await extraerTexto(new Uint8Array(fs.readFileSync(AMEX))));
+  });
+  const total = (u4: string) => sumarPorMoneda(r.tarjetas.find((t) => t.ultimos4 === u4)!.gastos);
+
+  it("encabezado", () => {
+    expect(r).toMatchObject({ tipo: "AMEX", cierre: "2026-08-27", vencimiento: "2026-09-07" });
+    expect(r.advertencias).toEqual([]);
+  });
+  it("mismo titular con dos tarjetas: se separan por últimos 4", () => {
+    expect(r.tarjetas.map((t) => t.ultimos4)).toEqual(["0616", "0029"]);
+    expect(r.tarjetas[0].titular).toBe(r.tarjetas[1].titular);
+    expect(total("0616")).toEqual({ ARS: 29231489, USD: 5997 });
+    expect(total("0029")).toEqual({ ARS: 0, USD: 11637 });
+  });
+  it("descripciones con '=' se guardan tal cual", () => {
+    expect(r.tarjetas[0].gastos.map((g) => g.descripcion)).toContain("=dlospotify");
+  });
+  it("pagos, impuestos y validaciones", () => {
+    expect(r.totalPagos).toEqual({ ARS: 0, USD: 0 });
+    expect(r.totalImpuestos).toEqual({ ARS: 8794448, USD: 0 });
+    const controles = validar({
+      ...r,
+      tarjetas: r.tarjetas.map((t) => ({ ...t, suma: sumarPorMoneda(t.gastos) })),
+    });
+    expect(controles.filter((c) => !c.ok)).toEqual([]);
+  });
+});
