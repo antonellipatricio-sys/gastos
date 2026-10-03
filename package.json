@@ -8,24 +8,31 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "preparar-subida": "node scripts/preparar-subida.mjs"
+    "migrar-a-mongo": "node --env-file-if-exists=.env.local scripts/migrar-a-mongo.mjs"
   },
   "dependencies": {
-    "@libsql/client": "^0.18.0",
+    "mongodb": "^7.7.0",
     "next": "16.3.8",
     "pdf-parse": "^2.4.5",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@libsql/client": "^0.18.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.8",
+    "mongodb-memory-server": "^11.3.0",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^5.0.3"
+  },
+  "config": {
+    "mongodbMemoryServer": {
+      "disablePostinstall": "1"
+    }
   }
 }

@@ -1,4 +1,5 @@
 // Saldos: cuánto le toca a cada persona de cada resumen (consumos + impuestos) y cuánto pagó.
+// Las cuentas las hace lib/saldos.ts; acá solo se buscan los datos.
 import type { Moneda } from "../parser/montos";
 import {
   calcularMovimientos,
@@ -8,14 +9,12 @@ import {
   saldoFinal,
   sumarTotales,
   type Cargo,
-  type CriterioImpuestos,
   type CuotaDeLaPersona,
   type GastoDelDetalle,
-  type ImpuestoManual,
   type LineaImpuesto,
   type Totales,
 } from "../saldos";
-import { aCentavos, db, todas, una } from "./conexion";
+import { colecciones, type ResumenDoc } from "./conexion";
 import { pagosDePersona } from "./pagos";
 import { listarPersonas } from "./personas";
 
@@ -27,81 +26,84 @@ function fechaCorta(iso: string) {
 }
 
 async function idDeVos(): Promise<number> {
-  const fila = await una<{ id: number }>(await db(), "SELECT id FROM personas ORDER BY es_yo DESC, id LIMIT 1");
-  if (!fila) throw new Error("No hay personas cargadas.");
-  return fila.id;
+  const col = await colecciones();
+  const vos = await col.personas.find().sort({ esYo: -1, _id: 1 }).limit(1).next();
+  if (!vos) throw new Error("No hay personas cargadas.");
+  return vos._id;
 }
 
-interface FilaResumenImpuestos {
-  id: number;
-  tipo_tarjeta: string;
-  cierre: string;
-  total_impuestos_pesos: number;
-  total_impuestos_dolares: number;
-  criterio_impuestos: CriterioImpuestos;
-}
-
-/** Consumo asignado a cada persona en un resumen (sin impuestos). */
-async function consumoDeResumen(resumenId: number): Promise<Map<number, Totales>> {
-  const filas = await todas<{ persona_id: number; moneda: Moneda; centavos: number }>(
-    await db(),
-    `SELECT a.persona_id, g.moneda, SUM(a.centavos) AS centavos
-     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
-     WHERE g.resumen_id = ? GROUP BY a.persona_id, g.moneda`,
-    [resumenId],
-  );
-  const mapa = new Map<number, Totales>();
+/**
+ * Consumo asignado a cada persona, por resumen (sin impuestos).
+ * Una sola consulta para todos los resúmenes pedidos: con la base en internet, menos viajes = más rápido.
+ */
+async function consumoPorResumen(resumenIds: number[]): Promise<Map<number, Map<number, Totales>>> {
+  const col = await colecciones();
+  const filas = await col.gastos
+    .aggregate<{ _id: { resumenId: number; personaId: number; moneda: Moneda }; centavos: number }>([
+      { $match: { resumenId: { $in: resumenIds } } },
+      { $unwind: "$partes" },
+      {
+        $group: {
+          _id: { resumenId: "$resumenId", personaId: "$partes.personaId", moneda: "$moneda" },
+          centavos: { $sum: "$partes.centavos" },
+        },
+      },
+    ])
+    .toArray();
+  const resultado = new Map<number, Map<number, Totales>>();
   for (const f of filas) {
-    const t = mapa.get(f.persona_id) ?? cero();
-    t[f.moneda] += f.centavos;
-    mapa.set(f.persona_id, t);
+    const porPersona = resultado.get(f._id.resumenId) ?? new Map<number, Totales>();
+    const t = porPersona.get(f._id.personaId) ?? cero();
+    t[f._id.moneda] += f.centavos;
+    porPersona.set(f._id.personaId, t);
+    resultado.set(f._id.resumenId, porPersona);
   }
-  return mapa;
+  return resultado;
 }
 
-async function calcularImpuestos(r: FilaResumenImpuestos, consumo: Map<number, Totales>) {
-  let lineas = await todas<LineaImpuesto>(
-    await db(),
-    "SELECT descripcion, moneda, centavos FROM impuestos_lineas WHERE resumen_id = ? ORDER BY rowid",
-    [r.id],
-  );
-  // Resúmenes importados antes de la Fase 3: solo tenemos el total, sin el detalle por línea.
-  const sinDetalle = lineas.length === 0 && (r.total_impuestos_pesos !== 0 || r.total_impuestos_dolares !== 0);
+function calcularImpuestos(r: ResumenDoc, consumo: Map<number, Totales>, yoId: number) {
+  let lineas: LineaImpuesto[] = r.impuestosLineas;
+  // Resúmenes importados antes de guardar el detalle de impuestos: solo tenemos el total.
+  const sinDetalle = lineas.length === 0 && (r.totalImpuestos.ARS !== 0 || r.totalImpuestos.USD !== 0);
   if (sinDetalle) {
-    lineas = [
-      { descripcion: "Impuestos (total)", moneda: "ARS" as const, centavos: aCentavos(r.total_impuestos_pesos) },
-      { descripcion: "Impuestos (total)", moneda: "USD" as const, centavos: aCentavos(r.total_impuestos_dolares) },
-    ].filter((l) => l.centavos !== 0);
+    lineas = (["ARS", "USD"] as const)
+      .map((moneda) => ({ descripcion: "Impuestos (total)", moneda, centavos: r.totalImpuestos[moneda] }))
+      .filter((l) => l.centavos !== 0);
   }
-  const manual = await todas<ImpuestoManual>(
-    await db(),
-    "SELECT persona_id AS personaId, moneda, centavos FROM impuestos_manual WHERE resumen_id = ?",
-    [r.id],
-  );
-  const porPersona = repartirImpuestos({ lineas, consumo, criterio: r.criterio_impuestos, manual, yoId: await idDeVos() });
-  return { criterio: r.criterio_impuestos, lineas, sinDetalle, manual, porPersona };
+  const porPersona = repartirImpuestos({
+    lineas,
+    consumo,
+    criterio: r.criterioImpuestos,
+    manual: r.impuestosManual,
+    yoId,
+  });
+  return { criterio: r.criterioImpuestos, lineas, sinDetalle, manual: r.impuestosManual, porPersona };
 }
 
 /** Impuestos de un resumen: líneas, criterio y cuánto le toca a cada persona. */
 export async function impuestosDeResumen(resumenId: number) {
-  const r = await una<FilaResumenImpuestos>(await db(), "SELECT * FROM resumenes WHERE id = ?", [resumenId]);
+  const col = await colecciones();
+  const r = await col.resumenes.findOne({ _id: resumenId });
   if (!r) return null;
-  return calcularImpuestos(r, await consumoDeResumen(resumenId));
+  const consumo = (await consumoPorResumen([resumenId])).get(resumenId) ?? new Map();
+  return calcularImpuestos(r, consumo, await idDeVos());
 }
 
 /** Un cargo por persona y por resumen: lo que consumió + su parte de impuestos. */
 async function cargosDeTodos(): Promise<Map<number, Omit<Cargo, "tipo">[]>> {
-  const resumenes = await todas<FilaResumenImpuestos>(await db(), "SELECT * FROM resumenes ORDER BY cierre, id");
+  const col = await colecciones();
+  const resumenes = await col.resumenes.find().sort({ cierre: 1, _id: 1 }).toArray();
+  const [consumos, yoId] = await Promise.all([consumoPorResumen(resumenes.map((r) => r._id)), idDeVos()]);
   const cargos = new Map<number, Omit<Cargo, "tipo">[]>();
   for (const r of resumenes) {
-    const consumo = await consumoDeResumen(r.id);
-    const { porPersona: impuestos } = await calcularImpuestos(r, consumo);
+    const consumo = consumos.get(r._id) ?? new Map<number, Totales>();
+    const { porPersona: impuestos } = calcularImpuestos(r, consumo, yoId);
     for (const id of new Set([...consumo.keys(), ...impuestos.keys()])) {
       const lista = cargos.get(id) ?? [];
       lista.push({
         fecha: r.cierre,
-        resumenId: r.id,
-        titulo: `${NOMBRE_TARJETA[r.tipo_tarjeta] ?? r.tipo_tarjeta} · cierre ${fechaCorta(r.cierre)}`,
+        resumenId: r._id,
+        titulo: `${NOMBRE_TARJETA[r.tipo] ?? r.tipo} · cierre ${fechaCorta(r.cierre)}`,
         consumo: consumo.get(id) ?? cero(),
         impuestos: impuestos.get(id) ?? cero(),
       });
@@ -122,10 +124,12 @@ export interface SaldoPersona {
 
 /** El saldo de cada persona: todo lo que se le asignó (con impuestos) menos todo lo que pagó. */
 export async function saldosPorPersona(): Promise<SaldoPersona[]> {
-  const cargos = await cargosDeTodos();
-  const pagos = await pagosDePersona(null);
-  return (await listarPersonas()).map((p) => {
-    const susCargos = (cargos.get(p.id) ?? []).reduce((t, c) => sumarTotales(t, sumarTotales(c.consumo, c.impuestos)), cero());
+  const [cargos, pagos, personas] = await Promise.all([cargosDeTodos(), pagosDePersona(null), listarPersonas()]);
+  return personas.map((p) => {
+    const susCargos = (cargos.get(p.id) ?? []).reduce(
+      (t, c) => sumarTotales(t, sumarTotales(c.consumo, c.impuestos)),
+      cero(),
+    );
     const susPagos = cero();
     for (const pago of pagos) if (pago.personaId === p.id) susPagos[pago.moneda] += pago.centavos;
     return {
@@ -141,80 +145,62 @@ export async function saldosPorPersona(): Promise<SaldoPersona[]> {
 
 /** Todo lo de una persona para su pantalla: movimientos, saldo, cuotas pendientes y gastos por resumen. */
 export async function cuentaDePersona(personaId: number) {
-  const persona = (await listarPersonas()).find((p) => p.id === personaId);
+  const col = await colecciones();
+  const persona = await col.personas.findOne({ _id: personaId });
   if (!persona) return null;
 
-  const movimientos = calcularMovimientos((await cargosDeTodos()).get(personaId) ?? [], await pagosDePersona(personaId));
+  const [cargos, pagos, susGastos, ultimosCierres] = await Promise.all([
+    cargosDeTodos(),
+    pagosDePersona(personaId),
+    col.gastos.find({ "partes.personaId": personaId }).sort({ resumenId: 1, fecha: 1, _id: 1 }).toArray(),
+    col.resumenes
+      .aggregate<{ _id: string; cierre: string }>([{ $group: { _id: "$tipo", cierre: { $max: "$cierre" } } }])
+      .toArray(),
+  ]);
+  const movimientos = calcularMovimientos(cargos.get(personaId) ?? [], pagos);
+  const suParte = (partes: { personaId: number; centavos: number }[]) =>
+    partes.find((p) => p.personaId === personaId)!.centavos;
 
   // Su parte de cada gasto, agrupada por resumen (para el detalle).
-  const filas = await todas<{
-    resumen_id: number;
-    fecha: string;
-    descripcion: string;
-    cuota_actual: number | null;
-    cuotas_totales: number | null;
-    moneda: Moneda;
-    centavos: number;
-    dividido: number;
-  }>(
-    await db(),
-    `SELECT g.resumen_id, g.fecha, g.descripcion, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos,
-            (SELECT COUNT(*) FROM asignaciones a2 WHERE a2.gasto_id = g.id) > 1 AS dividido
-     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
-     WHERE a.persona_id = ? ORDER BY g.resumen_id, g.fecha, g.id`,
-    [personaId],
-  );
   const gastosPorResumen = new Map<number, GastoDelDetalle[]>();
-  for (const f of filas) {
-    const lista = gastosPorResumen.get(f.resumen_id) ?? [];
+  for (const g of susGastos) {
+    const lista = gastosPorResumen.get(g.resumenId) ?? [];
     lista.push({
-      fecha: f.fecha,
-      descripcion: f.descripcion,
-      cuotaActual: f.cuota_actual,
-      cuotasTotales: f.cuotas_totales,
-      moneda: f.moneda,
-      centavos: f.centavos,
-      dividido: f.dividido === 1,
+      fecha: g.fecha,
+      descripcion: g.descripcion,
+      cuotaActual: g.cuotaActual,
+      cuotasTotales: g.cuotasTotales,
+      moneda: g.moneda,
+      centavos: suParte(g.partes),
+      dividido: g.partes.length > 1,
     });
-    gastosPorResumen.set(f.resumen_id, lista);
+    gastosPorResumen.set(g.resumenId, lista);
   }
 
   // Cuotas: solo del último resumen importado de cada tarjeta (si no, contaríamos la misma compra varias veces).
-  const cuotas = await todas<{
-    descripcion: string;
-    tipo_tarjeta: string;
-    ultimos_4: string;
-    cuota_actual: number;
-    cuotas_totales: number;
-    moneda: Moneda;
-    centavos: number;
-  }>(
-    await db(),
-    `SELECT g.descripcion, r.tipo_tarjeta, g.ultimos_4, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos
-     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id JOIN resumenes r ON r.id = g.resumen_id
-     WHERE a.persona_id = ? AND g.cuota_actual IS NOT NULL
-       AND r.cierre = (SELECT MAX(r2.cierre) FROM resumenes r2 WHERE r2.tipo_tarjeta = r.tipo_tarjeta)
-     ORDER BY g.cuotas_totales - g.cuota_actual DESC, g.descripcion`,
-    [personaId],
-  );
-  const pendientes = cuotasPendientes(
-    cuotas.map(
-      (c): CuotaDeLaPersona => ({
-        descripcion: c.descripcion,
-        tarjeta: `${NOMBRE_TARJETA[c.tipo_tarjeta] ?? c.tipo_tarjeta} ${c.ultimos_4}`,
-        cuotaActual: c.cuota_actual,
-        cuotasTotales: c.cuotas_totales,
-        moneda: c.moneda,
-        centavosPorCuota: c.centavos,
-      }),
-    ),
-  );
+  const esUltimo = (g: { tipo: string; cierre: string }) =>
+    ultimosCierres.some((u) => u._id === g.tipo && u.cierre === g.cierre);
+  const cuotas: CuotaDeLaPersona[] = susGastos
+    .filter((g) => g.cuotaActual !== null && g.cuotasTotales !== null && esUltimo(g))
+    .map((g) => ({
+      descripcion: g.descripcion,
+      tarjeta: `${NOMBRE_TARJETA[g.tipo] ?? g.tipo} ${g.ultimos4}`,
+      cuotaActual: g.cuotaActual!,
+      cuotasTotales: g.cuotasTotales!,
+      moneda: g.moneda,
+      centavosPorCuota: suParte(g.partes),
+    }))
+    .sort(
+      (a, b) =>
+        b.cuotasTotales - b.cuotaActual - (a.cuotasTotales - a.cuotaActual) ||
+        (a.descripcion < b.descripcion ? -1 : a.descripcion > b.descripcion ? 1 : 0),
+    );
 
   return {
-    persona: { id: persona.id, nombre: persona.nombre, esYo: persona.es_yo === 1 },
+    persona: { id: persona._id, nombre: persona.nombre, esYo: persona.esYo },
     movimientos,
     saldo: saldoFinal(movimientos),
     gastosPorResumen,
-    cuotas: pendientes,
+    cuotas: cuotasPendientes(cuotas),
   };
 }

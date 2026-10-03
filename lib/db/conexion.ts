@@ -1,127 +1,92 @@
-// Conexión a la base de datos y creación de tablas.
+// Conexión a MongoDB (Atlas en la nube, o el que indique MONGODB_URI).
 //
-// Usamos @libsql/client, que habla con dos tipos de base:
-//   - un archivo SQLite local (en tu compu): DATABASE_URL=file:data/gastos.db (es el default)
-//   - Turso, SQLite en la nube (para la versión publicada): DATABASE_URL=libsql://… + DATABASE_AUTH_TOKEN
-// El SQL es el mismo en los dos casos; solo cambia dónde vive la base.
-import { createClient, type Client, type InArgs, type Transaction } from "@libsql/client";
-import fs from "node:fs";
-import path from "node:path";
-import { mismoNombre } from "../reparto";
+// MongoDB guarda "documentos" (objetos tipo JSON) en "colecciones" (parecido a tablas).
+// Aprovechamos eso para guardar junto lo que va junto: por ejemplo, cada gasto lleva adentro
+// su reparto entre personas (`partes`), y cada resumen lleva sus subtotales e impuestos.
+import { MongoClient, type ClientSession, type Collection, type Db } from "mongodb";
+import type { Moneda } from "../parser/montos";
+import type { Parte } from "../reparto";
+import type { CriterioImpuestos, ImpuestoManual, LineaImpuesto, Totales } from "../saldos";
 
-// "CREATE TABLE IF NOT EXISTS" hace que esto se pueda correr siempre: la primera vez
-// crea las tablas y las siguientes no hace nada. Así, si ya tenías una base de una fase
-// anterior, al abrir la app se le agregan solas las tablas nuevas.
-const ESQUEMA = `
-CREATE TABLE IF NOT EXISTS resumenes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tipo_tarjeta TEXT NOT NULL,            -- 'VISA' | 'AMEX'
-  periodo TEXT NOT NULL,                 -- '30/07/26 – 27/08/26'
-  cierre TEXT NOT NULL,                  -- ISO '2026-08-27'
-  vencimiento TEXT NOT NULL,
-  total_impuestos_pesos REAL NOT NULL DEFAULT 0,
-  total_impuestos_dolares REAL NOT NULL DEFAULT 0,
-  -- Totales de control (para poder re-mostrar la validación sin el PDF)
-  total_pagos_pesos REAL NOT NULL DEFAULT 0,
-  total_pagos_dolares REAL NOT NULL DEFAULT 0,
-  saldo_anterior_pesos REAL,
-  saldo_anterior_dolares REAL,
-  total_a_pagar_pesos REAL,
-  total_a_pagar_dolares REAL,
-  importado_en TEXT NOT NULL DEFAULT (datetime('now')),
-  -- Un mismo resumen no se puede importar dos veces
-  UNIQUE (tipo_tarjeta, cierre)
-);
+// ---------------------------------------------------------------------------
+// Cómo es cada documento
+// ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS gastos (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  titular TEXT NOT NULL,
-  ultimos_4 TEXT NOT NULL,
-  fecha TEXT NOT NULL,                   -- ISO '2026-08-05'
-  descripcion TEXT NOT NULL,
-  cuota_actual INTEGER,
-  cuotas_totales INTEGER,
-  comprobante TEXT,
-  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
-  monto REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS gastos_resumen ON gastos(resumen_id);
+export interface PersonaDoc {
+  _id: number;
+  nombre: string;
+  esYo: boolean;
+}
 
--- Lo que dice el banco en "Subtotal de X", por tarjeta (para la validación)
-CREATE TABLE IF NOT EXISTS subtotales (
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  ultimos_4 TEXT NOT NULL,
-  titular TEXT NOT NULL,
-  pesos REAL,
-  dolares REAL,
-  PRIMARY KEY (resumen_id, ultimos_4)
-);
+/** Cada tarjeta física (tipo + últimos 4) y a quién se le asignan sus gastos por defecto. */
+export interface TarjetaDoc {
+  tipo: string;
+  ultimos4: string;
+  titular: string;
+  personaId: number | null;
+}
 
--- ===== Fase 2 =====
+export interface ResumenDoc {
+  _id: number;
+  tipo: string; // 'VISA' | 'AMEX'
+  periodo: string;
+  cierre: string; // ISO '2026-08-27'
+  vencimiento: string;
+  totalImpuestos: Totales; // en centavos
+  totalPagos: Totales;
+  saldoAnterior: Totales | null; // lo que dice el banco
+  totalAPagar: Totales | null;
+  criterioImpuestos: CriterioImpuestos;
+  /** Lo que dice el banco en "Subtotal de X", por tarjeta, en el orden del resumen. */
+  subtotales: { ultimos4: string; titular: string; banco: Totales | null }[];
+  impuestosLineas: LineaImpuesto[];
+  impuestosManual: ImpuestoManual[];
+  importadoEn: Date;
+}
 
--- Las personas a las que se les asignan gastos.
-CREATE TABLE IF NOT EXISTS personas (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  es_yo INTEGER NOT NULL DEFAULT 0       -- 1 = vos (tus gastos no generan deuda en la Fase 3)
-);
+export interface GastoDoc {
+  _id: number;
+  resumenId: number;
+  tipo: string; // copiado del resumen, para buscar cuotas anteriores sin cruzar colecciones
+  cierre: string; // ídem
+  titular: string;
+  ultimos4: string;
+  fecha: string;
+  descripcion: string;
+  cuotaActual: number | null;
+  cuotasTotales: number | null;
+  comprobante: string | null;
+  moneda: Moneda;
+  centavos: number;
+  /** Quién paga el gasto: vacío = sin asignar; varias partes = dividido. Suman `centavos`. */
+  partes: Parte[];
+}
 
--- Cada tarjeta física (tipo + últimos 4) y a quién se le asignan sus gastos por defecto.
-CREATE TABLE IF NOT EXISTS tarjetas (
-  tipo_tarjeta TEXT NOT NULL,
-  ultimos_4 TEXT NOT NULL,
-  titular TEXT NOT NULL,                 -- el nombre que figura en el resumen
-  persona_id INTEGER REFERENCES personas(id) ON DELETE SET NULL,
-  PRIMARY KEY (tipo_tarjeta, ultimos_4)
-);
+export interface PagoDoc {
+  _id: number;
+  personaId: number;
+  fecha: string;
+  moneda: Moneda; // la deuda que cancela
+  centavos: number;
+  pagadoEnPesos: number | null; // si pagó dólares con pesos: cuántos pesos dio
+  tipoCambio: number | null;
+  nota: string | null;
+  creadoEn: Date;
+}
 
--- Quién paga cada gasto. Un gasto puede tener varias filas (dividido entre personas)
--- o ninguna (sin asignar). La suma de las partes es igual al monto del gasto.
--- Los montos van en CENTAVOS ENTEROS para que la suma sea exacta.
-CREATE TABLE IF NOT EXISTS asignaciones (
-  gasto_id INTEGER NOT NULL REFERENCES gastos(id) ON DELETE CASCADE,
-  persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE RESTRICT,
-  centavos INTEGER NOT NULL,
-  PRIMARY KEY (gasto_id, persona_id)
-);
-CREATE INDEX IF NOT EXISTS asignaciones_persona ON asignaciones(persona_id);
+interface ContadorDoc {
+  _id: string;
+  valor: number;
+}
 
--- ===== Fase 3 =====
-
--- Cada línea de "Impuestos, intereses y percepciones" (para repartirlas según su origen).
-CREATE TABLE IF NOT EXISTS impuestos_lineas (
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  descripcion TEXT NOT NULL,
-  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
-  centavos INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS impuestos_lineas_resumen ON impuestos_lineas(resumen_id);
-
--- Reparto de impuestos cargado a mano (solo cuando el resumen usa el criterio 'manual').
-CREATE TABLE IF NOT EXISTS impuestos_manual (
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE RESTRICT,
-  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
-  centavos INTEGER NOT NULL,
-  PRIMARY KEY (resumen_id, persona_id, moneda)
-);
-
--- Pagos que te hace cada persona. "moneda" + "centavos" = qué deuda cancela.
--- Si te pagó dólares con pesos, se guarda además cuántos pesos dio y a qué cotización.
-CREATE TABLE IF NOT EXISTS pagos (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE RESTRICT,
-  fecha TEXT NOT NULL,                   -- ISO '2026-09-05'
-  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
-  centavos INTEGER NOT NULL CHECK (centavos > 0),
-  pagado_en_pesos_centavos INTEGER,
-  tipo_cambio REAL,
-  nota TEXT,
-  creado_en TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS pagos_persona ON pagos(persona_id);
-`;
+export interface Colecciones {
+  personas: Collection<PersonaDoc>;
+  tarjetas: Collection<TarjetaDoc>;
+  resumenes: Collection<ResumenDoc>;
+  gastos: Collection<GastoDoc>;
+  pagos: Collection<PagoDoc>;
+  contadores: Collection<ContadorDoc>;
+}
 
 // Las personas que se cargan la primera vez (después se pueden editar desde la app).
 const PERSONAS_INICIALES: { nombre: string; esYo: boolean }[] = [
@@ -133,145 +98,135 @@ const PERSONAS_INICIALES: { nombre: string; esYo: boolean }[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Ayudantes para no repetir código en cada consulta
-// ---------------------------------------------------------------------------
-
-/** Algo que puede ejecutar SQL: la conexión normal o una transacción abierta. */
-export type Ejecutor = Client | Transaction;
-
-/** Todas las filas de una consulta, como objetos { columna: valor }. */
-export async function todas<T>(ej: Ejecutor, sql: string, args: InArgs = []): Promise<T[]> {
-  const r = await ej.execute({ sql, args });
-  return r.rows.map((fila) => Object.fromEntries(r.columns.map((c, i) => [c, fila[i]])) as T);
-}
-
-/** La primera fila de una consulta (o undefined si no hay ninguna). */
-export async function una<T>(ej: Ejecutor, sql: string, args: InArgs = []): Promise<T | undefined> {
-  return (await todas<T>(ej, sql, args))[0];
-}
-
-/** Ejecuta un INSERT/UPDATE/DELETE. Devuelve el id insertado y cuántas filas cambió. */
-export async function ejecutar(ej: Ejecutor, sql: string, args: InArgs = []) {
-  const r = await ej.execute({ sql, args });
-  return { id: Number(r.lastInsertRowid ?? 0), cambios: r.rowsAffected };
-}
-
-/** Corre varias operaciones como una sola: si alguna falla, no se guarda ninguna. */
-export async function enTransaccion<T>(fn: (tx: Transaction) => Promise<T>): Promise<T> {
-  const tx = await (await db()).transaction("write");
-  try {
-    const resultado = await fn(tx);
-    await tx.commit();
-    return resultado;
-  } catch (e) {
-    await tx.rollback();
-    throw e;
-  } finally {
-    tx.close();
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Conexión
 // ---------------------------------------------------------------------------
 
-function urlBase(): string {
-  return process.env.DATABASE_URL ?? `file:${path.join(process.cwd(), "data", "gastos.db")}`;
+interface Conexion {
+  cliente: MongoClient;
+  db: Db;
+  col: Colecciones;
 }
 
-// En desarrollo Next recarga los módulos seguido; guardamos la conexión (ya preparada)
-// en globalThis para no abrir una nueva ni repetir las migraciones en cada recarga.
-const global = globalThis as unknown as { __db?: Promise<Client> };
+// Guardamos la conexión en globalThis: en Vercel (y en desarrollo, donde Next recarga los
+// módulos seguido) así se reusa la misma en vez de abrir una nueva en cada visita.
+const global = globalThis as unknown as { __mongo?: Promise<Conexion> };
 
-export function db(): Promise<Client> {
-  global.__db ??= abrir().catch((e) => {
-    global.__db = undefined; // si falló (ej. sin internet), que el próximo intento vuelva a probar
+function conexion(): Promise<Conexion> {
+  global.__mongo ??= abrir().catch((e) => {
+    global.__mongo = undefined; // si falló (ej. sin internet), que el próximo intento vuelva a probar
     throw e;
   });
-  return global.__db;
+  return global.__mongo;
 }
 
-async function abrir(): Promise<Client> {
-  const url = urlBase();
-  if (url.startsWith("file:")) {
-    fs.mkdirSync(path.dirname(url.slice("file:".length)), { recursive: true });
-  }
-  const cliente = createClient({ url, authToken: process.env.DATABASE_AUTH_TOKEN });
-  if (url.startsWith("file:")) await cliente.execute("PRAGMA journal_mode = WAL");
-  await cliente.executeMultiple(ESQUEMA);
-  // Fase 3: cómo se reparten los impuestos de cada resumen ('proporcional' | 'yo' | 'manual').
-  await agregarColumna(cliente, "resumenes", "criterio_impuestos", "TEXT NOT NULL DEFAULT 'proporcional'");
-
-  const hay = await una<{ n: number }>(cliente, "SELECT COUNT(*) AS n FROM personas");
-  if (hay!.n === 0) {
-    for (const p of PERSONAS_INICIALES) {
-      await ejecutar(cliente, "INSERT INTO personas (nombre, es_yo) VALUES (?, ?)", [p.nombre, p.esYo ? 1 : 0]);
-    }
-  }
-  await migrarTarjetasFaltantes(cliente);
-  return cliente;
+/** Las colecciones, listas para usar. */
+export async function colecciones(): Promise<Colecciones> {
+  return (await conexion()).col;
 }
 
-/** Agrega una columna a una tabla existente si todavía no la tiene (SQLite no tiene "ADD COLUMN IF NOT EXISTS"). */
-async function agregarColumna(cliente: Client, tabla: string, columna: string, definicion: string) {
-  const columnas = await todas<{ name: string }>(cliente, `PRAGMA table_info(${tabla})`);
-  if (!columnas.some((c) => c.name === columna)) {
-    await cliente.execute(`ALTER TABLE ${tabla} ADD COLUMN ${columna} ${definicion}`);
+async function abrir(): Promise<Conexion> {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) {
+    throw new Error(
+      "Falta configurar MONGODB_URI (la dirección de tu base en MongoDB Atlas). " +
+        "En tu compu va en el archivo .env.local; publicada, en las variables de entorno de Vercel. Ver el README.",
+    );
   }
+  const cliente = new MongoClient(uri);
+  await cliente.connect();
+  const db = cliente.db(process.env.MONGODB_DB || "gastos");
+  const col: Colecciones = {
+    personas: db.collection("personas"),
+    tarjetas: db.collection("tarjetas"),
+    resumenes: db.collection("resumenes"),
+    gastos: db.collection("gastos"),
+    pagos: db.collection("pagos"),
+    contadores: db.collection("contadores"),
+  };
+  await prepararIndices(col);
+  await cargarPersonasIniciales(col);
+  return { cliente, db, col };
 }
 
 /**
- * Migración para bases creadas en la Fase 1: registra las tarjetas de los resúmenes ya
- * importados que todavía no están en la tabla "tarjetas", les sugiere dueño por el nombre
- * del titular y le asigna los gastos sin asignar. Si no falta ninguna, no hace nada.
+ * Índices: hacen rápidas las búsquedas y, los "unique", impiden duplicados.
+ * createIndex no hace nada si el índice ya existe, así que se puede correr siempre.
  */
-async function migrarTarjetasFaltantes(cliente: Client) {
-  const faltantes = await todas<{ tipo_tarjeta: string; ultimos_4: string; titular: string }>(
-    cliente,
-    `SELECT DISTINCT r.tipo_tarjeta, s.ultimos_4, s.titular
-     FROM subtotales s JOIN resumenes r ON r.id = s.resumen_id
-     WHERE NOT EXISTS (SELECT 1 FROM tarjetas t
-                       WHERE t.tipo_tarjeta = r.tipo_tarjeta AND t.ultimos_4 = s.ultimos_4)`,
-  );
-  if (faltantes.length === 0) return;
+async function prepararIndices(col: Colecciones) {
+  // Un mismo resumen no se puede importar dos veces (mismo tipo de tarjeta + misma fecha de cierre).
+  await col.resumenes.createIndex({ tipo: 1, cierre: 1 }, { unique: true });
+  await col.tarjetas.createIndex({ tipo: 1, ultimos4: 1 }, { unique: true });
+  // Nombres de personas únicos sin distinguir mayúsculas ni tildes ("micaela" = "Micaela").
+  await col.personas.createIndex({ nombre: 1 }, { unique: true, collation: { locale: "es", strength: 1 } });
+  await col.gastos.createIndex({ resumenId: 1 });
+  await col.gastos.createIndex({ "partes.personaId": 1 });
+  await col.gastos.createIndex({ tipo: 1, ultimos4: 1, descripcion: 1, cuotasTotales: 1, cuotaActual: 1 });
+  await col.pagos.createIndex({ personaId: 1, fecha: 1 });
+}
 
-  const personas = await todas<{ id: number; nombre: string }>(cliente, "SELECT id, nombre FROM personas");
-  const tx = await cliente.transaction("write");
+async function cargarPersonasIniciales(col: Colecciones) {
+  if ((await col.personas.estimatedDocumentCount()) > 0) return;
+  const primerId = await siguientesIds(col, "personas", PERSONAS_INICIALES.length);
   try {
-    for (const t of faltantes) {
-      const duenio = personas.find((p) => mismoNombre(t.titular, p.nombre))?.id ?? null;
-      await ejecutar(
-        tx,
-        "INSERT OR IGNORE INTO tarjetas (tipo_tarjeta, ultimos_4, titular, persona_id) VALUES (?, ?, ?, ?)",
-        [t.tipo_tarjeta, t.ultimos_4, t.titular, duenio],
-      );
-      if (duenio === null) continue;
-      await ejecutar(
-        tx,
-        `INSERT INTO asignaciones (gasto_id, persona_id, centavos)
-         SELECT g.id, ?, CAST(ROUND(g.monto * 100) AS INTEGER)
-         FROM gastos g JOIN resumenes r ON r.id = g.resumen_id
-         WHERE r.tipo_tarjeta = ? AND g.ultimos_4 = ?
-           AND NOT EXISTS (SELECT 1 FROM asignaciones a WHERE a.gasto_id = g.id)`,
-        [duenio, t.tipo_tarjeta, t.ultimos_4],
-      );
-    }
-    await tx.commit();
+    await col.personas.insertMany(
+      PERSONAS_INICIALES.map((p, i) => ({ _id: primerId + i, nombre: p.nombre, esYo: p.esYo })),
+    );
   } catch (e) {
-    await tx.rollback();
-    throw e;
-  } finally {
-    tx.close();
+    // Si otra visita las cargó al mismo tiempo, el índice único lo frena: no pasa nada.
+    if (!esDuplicado(e)) throw e;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Ayudantes
+// ---------------------------------------------------------------------------
+
+/**
+ * Reserva `cantidad` ids numéricos seguidos para una colección y devuelve el primero.
+ * Usamos números (1, 2, 3…) en vez de los ids largos de Mongo para que los links de la app
+ * sigan siendo cortos (/resumenes/3, /personas/5).
+ */
+export async function siguientesIds(
+  col: Colecciones,
+  nombre: string,
+  cantidad = 1,
+  session?: ClientSession,
+): Promise<number> {
+  const r = await col.contadores.findOneAndUpdate(
+    { _id: nombre },
+    { $inc: { valor: cantidad } },
+    { upsert: true, returnDocument: "after", session },
+  );
+  return r!.valor - cantidad + 1;
+}
+
+/** Corre varias operaciones como una sola: si alguna falla, no se guarda ninguna. */
+export async function enTransaccion<T>(fn: (session: ClientSession, col: Colecciones) => Promise<T>): Promise<T> {
+  const { cliente, col } = await conexion();
+  const session = cliente.startSession();
+  try {
+    let resultado: T;
+    await session.withTransaction(async () => {
+      resultado = await fn(session, col);
+    });
+    return resultado!;
+  } finally {
+    await session.endSession();
+  }
+}
+
+/** ¿El error es "ya existe un documento con esa clave única"? */
+export function esDuplicado(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: number }).code === 11000;
 }
 
 /** Solo para tests: cierra la conexión para poder abrir otra base. */
 export async function cerrarDb() {
-  const abierta = global.__db;
-  global.__db = undefined;
-  (await abierta)?.close();
+  const abierta = global.__mongo;
+  global.__mongo = undefined;
+  await (await abierta)?.cliente.close();
 }
 
-// --- Conversión centavos (cálculos) ↔ pesos (columnas REAL de la Fase 1) ---
+// --- Conversión centavos ↔ pesos (algunas pantallas muestran montos en pesos) ---
 export const aPesos = (centavos: number) => centavos / 100;
 export const aCentavos = (pesos: number) => Math.round(pesos * 100);

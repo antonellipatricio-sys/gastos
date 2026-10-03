@@ -1,8 +1,7 @@
 // Tests de la Fase 3: reparto de impuestos, saldos, pagos, cuotas pendientes y el detalle.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest";
 import {
   armarDetalle,
   calcularMovimientos,
@@ -113,10 +112,10 @@ describe("movimientos, cuotas y detalle", () => {
   });
 });
 
-// --- Integración con el resumen Visa real y una base temporal ---
+// --- Integración con el resumen Visa real y el MongoDB en memoria de los tests ---
 const VISA = path.join(__dirname, "..", "resumenes", "visa-2026-09.pdf");
-const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), "gastos-saldos-"));
-process.env.DATABASE_URL = `file:${path.join(carpeta, "test.db")}`;
+process.env.MONGODB_URI = inject("mongoUri");
+process.env.MONGODB_DB = "test_saldos";
 
 describe.skipIf(!fs.existsSync(VISA))("saldos con el resumen Visa real", () => {
   let dbMod: typeof import("../lib/db");
@@ -133,7 +132,6 @@ describe.skipIf(!fs.existsSync(VISA))("saldos con el resumen Visa real", () => {
   });
   afterAll(async () => {
     await (await import("../lib/db/conexion")).cerrarDb();
-    fs.rmSync(carpeta, { recursive: true, force: true });
   });
 
   it("guarda las 9 líneas de impuestos y el reparto proporcional suma exacto", async () => {

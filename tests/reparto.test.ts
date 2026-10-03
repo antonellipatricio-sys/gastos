@@ -1,8 +1,5 @@
 // Tests de la Fase 2: repartos y asignación automática al importar.
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, inject, it } from "vitest";
 import { escalarReparto, mismoNombre, partesIguales, validarReparto } from "../lib/reparto";
 import type { Resumen } from "../lib/parser/santander";
 
@@ -31,13 +28,13 @@ describe("cuentas de reparto", () => {
   });
 });
 
-// --- Integración con una base de datos temporal ---
-const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), "gastos-test-"));
-process.env.DATABASE_URL = `file:${path.join(carpeta, "test.db")}`;
+// --- Integración con el MongoDB en memoria de los tests (ver tests/mongo-global.ts) ---
+process.env.MONGODB_URI = inject("mongoUri");
+process.env.MONGODB_DB = "test_reparto";
 
-// Importamos después de fijar DATABASE_URL para que la conexión use la base temporal.
+// Importamos después de fijar MONGODB_URI para que la conexión use la base de prueba.
 const dbMod = await import("../lib/db");
-const { cerrarDb, db, una } = await import("../lib/db/conexion");
+const { cerrarDb, colecciones } = await import("../lib/db/conexion");
 
 function resumen(cierre: string, gastos: Resumen["tarjetas"][number]["gastos"], titular = "Micaela Boggio Diaz"): Resumen {
   return {
@@ -73,7 +70,6 @@ describe("asignación al importar", () => {
   });
   afterAll(async () => {
     await cerrarDb();
-    fs.rmSync(carpeta, { recursive: true, force: true });
   });
 
   it("carga las personas iniciales", async () => {
@@ -122,6 +118,7 @@ describe("asignación al importar", () => {
     const banay = (await dbMod.listarPersonas()).find((p) => p.nombre === "Banay")!;
     const asignados = await dbMod.asignarDuenioTarjeta("VISA", "8337", banay.id);
     expect(asignados).toBe(1);
-    expect(await una(await db(), "SELECT persona_id FROM asignaciones WHERE gasto_id = ?", [g.id])).toEqual({ persona_id: banay.id });
+    const guardado = await (await colecciones()).gastos.findOne({ _id: g.id });
+    expect(guardado!.partes).toEqual([{ personaId: banay.id, centavos: guardado!.centavos }]);
   });
 });

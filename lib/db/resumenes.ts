@@ -3,11 +3,19 @@ import type { Resumen, Totales } from "../parser/santander";
 import type { DatosValidacion } from "../parser/validar";
 import { mismoNombre, type Parte } from "../reparto";
 import type { CriterioImpuestos, ImpuestoManual } from "../saldos";
-import { guardarPartes, partesDeResumen, repartoAutomatico } from "./asignaciones";
-import { aCentavos, aPesos, db, ejecutar, enTransaccion, todas, una } from "./conexion";
+import { repartoAutomatico } from "./asignaciones";
+import {
+  aPesos,
+  colecciones,
+  enTransaccion,
+  esDuplicado,
+  siguientesIds,
+  type GastoDoc,
+  type ResumenDoc,
+} from "./conexion";
 
-const totalesDe = (ars: number | null, usd: number | null): Totales | null =>
-  ars === null || usd === null ? null : { ARS: aCentavos(ars), USD: aCentavos(usd) };
+// Las pantallas reciben los datos con estos nombres (vienen de la primera versión de la app,
+// con SQLite). Los mantenemos para no tener que cambiar ninguna pantalla.
 
 export interface FilaResumen {
   id: number;
@@ -36,11 +44,46 @@ export interface FilaGasto {
   cuotas_totales: number | null;
   comprobante: string | null;
   moneda: "ARS" | "USD";
-  monto: number;
+  monto: number; // en pesos (o dólares), no en centavos
+}
+
+function aFilaResumen(r: ResumenDoc): FilaResumen {
+  return {
+    id: r._id,
+    tipo_tarjeta: r.tipo,
+    periodo: r.periodo,
+    cierre: r.cierre,
+    vencimiento: r.vencimiento,
+    total_impuestos_pesos: aPesos(r.totalImpuestos.ARS),
+    total_impuestos_dolares: aPesos(r.totalImpuestos.USD),
+    total_pagos_pesos: aPesos(r.totalPagos.ARS),
+    total_pagos_dolares: aPesos(r.totalPagos.USD),
+    saldo_anterior_pesos: r.saldoAnterior ? aPesos(r.saldoAnterior.ARS) : null,
+    saldo_anterior_dolares: r.saldoAnterior ? aPesos(r.saldoAnterior.USD) : null,
+    total_a_pagar_pesos: r.totalAPagar ? aPesos(r.totalAPagar.ARS) : null,
+    total_a_pagar_dolares: r.totalAPagar ? aPesos(r.totalAPagar.USD) : null,
+    criterio_impuestos: r.criterioImpuestos,
+  };
+}
+
+function aFilaGasto(g: GastoDoc): FilaGasto {
+  return {
+    id: g._id,
+    titular: g.titular,
+    ultimos_4: g.ultimos4,
+    fecha: g.fecha,
+    descripcion: g.descripcion,
+    cuota_actual: g.cuotaActual,
+    cuotas_totales: g.cuotasTotales,
+    comprobante: g.comprobante,
+    moneda: g.moneda,
+    monto: aPesos(g.centavos),
+  };
 }
 
 export async function buscarResumen(tipo: string, cierre: string): Promise<{ id: number } | undefined> {
-  return una(await db(), "SELECT id FROM resumenes WHERE tipo_tarjeta = ? AND cierre = ?", [tipo, cierre]);
+  const r = await (await colecciones()).resumenes.findOne({ tipo, cierre }, { projection: { _id: 1 } });
+  return r ? { id: r._id } : undefined;
 }
 
 /**
@@ -48,132 +91,134 @@ export async function buscarResumen(tipo: string, cierre: string): Promise<{ id:
  * o se guarda todo, o nada.
  */
 export async function guardarResumen(r: Resumen): Promise<number> {
-  return enTransaccion(async (tx) => {
-    const { id: resumenId } = await ejecutar(
-      tx,
-      `INSERT INTO resumenes (tipo_tarjeta, periodo, cierre, vencimiento,
-         total_impuestos_pesos, total_impuestos_dolares, total_pagos_pesos, total_pagos_dolares,
-         saldo_anterior_pesos, saldo_anterior_dolares, total_a_pagar_pesos, total_a_pagar_dolares)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        r.tipo, r.periodo, r.cierre, r.vencimiento,
-        aPesos(r.totalImpuestos.ARS), aPesos(r.totalImpuestos.USD),
-        aPesos(r.totalPagos.ARS), aPesos(r.totalPagos.USD),
-        r.saldoAnteriorBanco ? aPesos(r.saldoAnteriorBanco.ARS) : null,
-        r.saldoAnteriorBanco ? aPesos(r.saldoAnteriorBanco.USD) : null,
-        r.totalAPagarBanco ? aPesos(r.totalAPagarBanco.ARS) : null,
-        r.totalAPagarBanco ? aPesos(r.totalAPagarBanco.USD) : null,
-      ],
-    );
-
-    for (const i of r.impuestos) {
-      await ejecutar(tx, "INSERT INTO impuestos_lineas (resumen_id, descripcion, moneda, centavos) VALUES (?, ?, ?, ?)", [
-        resumenId, i.descripcion, i.moneda, i.centavos,
-      ]);
-    }
-
-    const personas = await todas<{ id: number; nombre: string }>(tx, "SELECT id, nombre FROM personas");
-
-    for (const t of r.tarjetas) {
-      await ejecutar(tx, "INSERT INTO subtotales (resumen_id, ultimos_4, titular, pesos, dolares) VALUES (?, ?, ?, ?, ?)", [
-        resumenId, t.ultimos4, t.titular,
-        t.subtotalBanco ? aPesos(t.subtotalBanco.ARS) : null,
-        t.subtotalBanco ? aPesos(t.subtotalBanco.USD) : null,
-      ]);
-
-      // Primera vez que vemos esta tarjeta: la registramos y sugerimos dueño por el nombre del titular.
-      let tarjeta = await una<{ persona_id: number | null }>(
-        tx,
-        "SELECT persona_id FROM tarjetas WHERE tipo_tarjeta = ? AND ultimos_4 = ?",
-        [r.tipo, t.ultimos4],
+  try {
+    return await enTransaccion(async (session, col) => {
+      const resumenId = await siguientesIds(col, "resumenes", 1, session);
+      await col.resumenes.insertOne(
+        {
+          _id: resumenId,
+          tipo: r.tipo,
+          periodo: r.periodo,
+          cierre: r.cierre,
+          vencimiento: r.vencimiento,
+          totalImpuestos: r.totalImpuestos,
+          totalPagos: r.totalPagos,
+          saldoAnterior: r.saldoAnteriorBanco,
+          totalAPagar: r.totalAPagarBanco,
+          criterioImpuestos: "proporcional",
+          subtotales: r.tarjetas.map((t) => ({ ultimos4: t.ultimos4, titular: t.titular, banco: t.subtotalBanco })),
+          impuestosLineas: r.impuestos,
+          impuestosManual: [],
+          importadoEn: new Date(),
+        },
+        { session },
       );
-      if (!tarjeta) {
-        const sugerida = personas.find((p) => mismoNombre(t.titular, p.nombre))?.id ?? null;
-        await ejecutar(tx, "INSERT INTO tarjetas (tipo_tarjeta, ultimos_4, titular, persona_id) VALUES (?, ?, ?, ?)", [
-          r.tipo, t.ultimos4, t.titular, sugerida,
-        ]);
-        tarjeta = { persona_id: sugerida };
-      }
 
-      for (const g of t.gastos) {
-        const { id: gastoId } = await ejecutar(
-          tx,
-          `INSERT INTO gastos (resumen_id, titular, ultimos_4, fecha, descripcion, cuota_actual,
-             cuotas_totales, comprobante, moneda, monto) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            resumenId, t.titular, t.ultimos4, g.fecha, g.descripcion, g.cuotaActual,
-            g.cuotasTotales, g.comprobante, g.moneda, aPesos(g.centavos),
-          ],
-        );
-        const partes = await repartoAutomatico(
-          tx,
-          {
-            id: gastoId,
-            tipoTarjeta: r.tipo,
+      const personas = await col.personas.find({}, { session }).toArray();
+      const totalGastos = r.tarjetas.reduce((n, t) => n + t.gastos.length, 0);
+      let siguienteGasto = totalGastos > 0 ? await siguientesIds(col, "gastos", totalGastos, session) : 0;
+      const gastos: GastoDoc[] = [];
+
+      for (const t of r.tarjetas) {
+        // Primera vez que vemos esta tarjeta: la registramos y sugerimos dueño por el nombre del titular.
+        const tarjeta = await col.tarjetas.findOne({ tipo: r.tipo, ultimos4: t.ultimos4 }, { session });
+        let duenio = tarjeta?.personaId ?? null;
+        if (!tarjeta) {
+          duenio = personas.find((p) => mismoNombre(t.titular, p.nombre))?._id ?? null;
+          await col.tarjetas.insertOne(
+            { tipo: r.tipo, ultimos4: t.ultimos4, titular: t.titular, personaId: duenio },
+            { session },
+          );
+        }
+
+        for (const g of t.gastos) {
+          const partes = await repartoAutomatico(
+            col,
+            {
+              tipoTarjeta: r.tipo,
+              cierre: r.cierre,
+              ultimos4: t.ultimos4,
+              descripcion: g.descripcion,
+              cuotaActual: g.cuotaActual,
+              cuotasTotales: g.cuotasTotales,
+              comprobante: g.comprobante,
+              moneda: g.moneda,
+              centavos: g.centavos,
+            },
+            duenio,
+            session,
+          );
+          gastos.push({
+            _id: siguienteGasto++,
+            resumenId,
+            tipo: r.tipo,
             cierre: r.cierre,
+            titular: t.titular,
             ultimos4: t.ultimos4,
+            fecha: g.fecha,
             descripcion: g.descripcion,
             cuotaActual: g.cuotaActual,
             cuotasTotales: g.cuotasTotales,
             comprobante: g.comprobante,
             moneda: g.moneda,
             centavos: g.centavos,
-          },
-          tarjeta.persona_id,
-        );
-        await guardarPartes(tx, gastoId, partes);
+            partes,
+          });
+        }
       }
-    }
-    return resumenId;
-  });
+      if (gastos.length) await col.gastos.insertMany(gastos, { session });
+      return resumenId;
+    });
+  } catch (e) {
+    if (esDuplicado(e)) throw new Error(`Este resumen ${r.tipo} con cierre ${r.cierre} ya estaba importado.`);
+    throw e;
+  }
 }
 
 export async function listarResumenes(): Promise<(FilaResumen & { cantidad_gastos: number; sin_asignar: number })[]> {
-  return todas(
-    await db(),
-    `SELECT r.*,
-       (SELECT COUNT(*) FROM gastos g WHERE g.resumen_id = r.id) AS cantidad_gastos,
-       (SELECT COUNT(*) FROM gastos g WHERE g.resumen_id = r.id
-          AND NOT EXISTS (SELECT 1 FROM asignaciones a WHERE a.gasto_id = g.id)) AS sin_asignar
-     FROM resumenes r ORDER BY r.cierre DESC, r.tipo_tarjeta`,
-  );
+  const col = await colecciones();
+  const [resumenes, conteos] = await Promise.all([
+    col.resumenes.find().sort({ cierre: -1, tipo: 1 }).toArray(),
+    col.gastos
+      .aggregate<{ _id: number; total: number; sinAsignar: number }>([
+        {
+          $group: {
+            _id: "$resumenId",
+            total: { $sum: 1 },
+            sinAsignar: { $sum: { $cond: [{ $eq: [{ $size: "$partes" }, 0] }, 1, 0] } },
+          },
+        },
+      ])
+      .toArray(),
+  ]);
+  return resumenes.map((r) => {
+    const c = conteos.find((x) => x._id === r._id);
+    return { ...aFilaResumen(r), cantidad_gastos: c?.total ?? 0, sin_asignar: c?.sinAsignar ?? 0 };
+  });
 }
 
 export type GastoConPartes = FilaGasto & { partes: Parte[] };
 
 export async function obtenerResumen(id: number) {
-  const conexion = await db();
-  const resumen = await una<FilaResumen>(conexion, "SELECT * FROM resumenes WHERE id = ?", [id]);
-  if (!resumen) return null;
-  const partes = await partesDeResumen(id);
-  const gastos: GastoConPartes[] = (
-    await todas<FilaGasto>(conexion, "SELECT * FROM gastos WHERE resumen_id = ? ORDER BY id", [id])
-  ).map((g) => ({ ...g, partes: partes.get(g.id) ?? [] }));
-  const subtotales = await todas<{ ultimos_4: string; titular: string; pesos: number | null; dolares: number | null }>(
-    conexion,
-    "SELECT * FROM subtotales WHERE resumen_id = ? ORDER BY rowid",
-    [id],
-  );
+  const col = await colecciones();
+  const doc = await col.resumenes.findOne({ _id: id });
+  if (!doc) return null;
+  const docsGastos = await col.gastos.find({ resumenId: id }).sort({ _id: 1 }).toArray();
+  const gastos: GastoConPartes[] = docsGastos.map((g) => ({ ...aFilaGasto(g), partes: g.partes }));
 
   // Agrupamos por tarjeta (titular + últimos 4), respetando el orden del resumen.
-  const tarjetas = subtotales.map((s) => {
-    const suyos = gastos.filter((g) => g.ultimos_4 === s.ultimos_4);
+  const tarjetas = doc.subtotales.map((s) => {
+    const suyos = gastos.filter((g) => g.ultimos_4 === s.ultimos4);
     const suma = { ARS: 0, USD: 0 };
-    for (const g of suyos) suma[g.moneda] += aCentavos(g.monto);
-    return {
-      titular: s.titular,
-      ultimos4: s.ultimos_4,
-      gastos: suyos,
-      suma,
-      subtotalBanco: totalesDe(s.pesos, s.dolares),
-    };
+    for (const g of docsGastos) if (g.ultimos4 === s.ultimos4) suma[g.moneda] += g.centavos;
+    return { titular: s.titular, ultimos4: s.ultimos4, gastos: suyos, suma, subtotalBanco: s.banco };
   });
 
   // Totales por persona en este resumen (y lo que quedó sin asignar).
   const porPersona = new Map<number, Totales>();
   const sinAsignar: Totales = { ARS: 0, USD: 0 };
-  for (const g of gastos) {
-    if (g.partes.length === 0) sinAsignar[g.moneda] += aCentavos(g.monto);
+  for (const g of docsGastos) {
+    if (g.partes.length === 0) sinAsignar[g.moneda] += g.centavos;
     for (const p of g.partes) {
       const t = porPersona.get(p.personaId) ?? { ARS: 0, USD: 0 };
       t[g.moneda] += p.centavos;
@@ -183,29 +228,24 @@ export async function obtenerResumen(id: number) {
 
   const validacion: DatosValidacion = {
     tarjetas,
-    totalPagos: { ARS: aCentavos(resumen.total_pagos_pesos), USD: aCentavos(resumen.total_pagos_dolares) },
-    saldoAnteriorBanco: totalesDe(resumen.saldo_anterior_pesos, resumen.saldo_anterior_dolares),
-    totalImpuestos: { ARS: aCentavos(resumen.total_impuestos_pesos), USD: aCentavos(resumen.total_impuestos_dolares) },
-    totalAPagarBanco: totalesDe(resumen.total_a_pagar_pesos, resumen.total_a_pagar_dolares),
+    totalPagos: doc.totalPagos,
+    saldoAnteriorBanco: doc.saldoAnterior,
+    totalImpuestos: doc.totalImpuestos,
+    totalAPagarBanco: doc.totalAPagar,
   };
-  return { resumen, tarjetas, validacion, porPersona, sinAsignar };
+  return { resumen: aFilaResumen(doc), tarjetas, validacion, porPersona, sinAsignar };
 }
 
-/** Borra un resumen con todo lo suyo (gastos, repartos, impuestos), por ejemplo para reimportarlo. */
+/** Borra un resumen con todo lo suyo (gastos y repartos), por ejemplo para reimportarlo. */
 export async function borrarResumen(id: number): Promise<void> {
-  // Borramos tabla por tabla en vez de confiar en el "ON DELETE CASCADE": así funciona igual
-  // aunque la base no tenga activadas las foreign keys.
-  await enTransaccion(async (tx) => {
-    await ejecutar(tx, "DELETE FROM asignaciones WHERE gasto_id IN (SELECT id FROM gastos WHERE resumen_id = ?)", [id]);
-    for (const tabla of ["gastos", "subtotales", "impuestos_lineas", "impuestos_manual"]) {
-      await ejecutar(tx, `DELETE FROM ${tabla} WHERE resumen_id = ?`, [id]);
-    }
-    await ejecutar(tx, "DELETE FROM resumenes WHERE id = ?", [id]);
+  await enTransaccion(async (session, col) => {
+    await col.gastos.deleteMany({ resumenId: id }, { session });
+    await col.resumenes.deleteOne({ _id: id }, { session });
   });
 }
 
 export async function cambiarCriterioImpuestos(id: number, criterio: CriterioImpuestos): Promise<void> {
-  await ejecutar(await db(), "UPDATE resumenes SET criterio_impuestos = ? WHERE id = ?", [criterio, id]);
+  await (await colecciones()).resumenes.updateOne({ _id: id }, { $set: { criterioImpuestos: criterio } });
 }
 
 /**
@@ -213,28 +253,31 @@ export async function cambiarCriterioImpuestos(id: number, criterio: CriterioImp
  * Por cada moneda, las partes tienen que sumar exactamente el total de impuestos del resumen.
  */
 export async function guardarImpuestosManual(id: number, partes: ImpuestoManual[]): Promise<void> {
-  const r = await una<{ total_impuestos_pesos: number; total_impuestos_dolares: number }>(
-    await db(),
-    "SELECT total_impuestos_pesos, total_impuestos_dolares FROM resumenes WHERE id = ?",
-    [id],
-  );
+  const col = await colecciones();
+  const r = await col.resumenes.findOne({ _id: id }, { projection: { totalImpuestos: 1 } });
   if (!r) throw new Error("El resumen no existe.");
-  const total = { ARS: aCentavos(r.total_impuestos_pesos), USD: aCentavos(r.total_impuestos_dolares) };
   for (const moneda of ["ARS", "USD"] as const) {
     const suma = partes.filter((p) => p.moneda === moneda).reduce((s, p) => s + p.centavos, 0);
-    if (suma !== total[moneda]) {
+    if (suma !== r.totalImpuestos[moneda]) {
       const f = (c: number) => (c / 100).toLocaleString("es-AR", { minimumFractionDigits: 2 });
-      throw new Error(`Los impuestos en ${moneda === "ARS" ? "pesos" : "dólares"} suman ${f(suma)} y deberían sumar ${f(total[moneda])}.`);
+      throw new Error(
+        `Los impuestos en ${moneda === "ARS" ? "pesos" : "dólares"} suman ${f(suma)} y deberían sumar ${f(r.totalImpuestos[moneda])}.`,
+      );
     }
   }
-  await enTransaccion(async (tx) => {
-    await ejecutar(tx, "DELETE FROM impuestos_manual WHERE resumen_id = ?", [id]);
-    for (const p of partes) {
-      if (p.centavos === 0) continue;
-      await ejecutar(tx, "INSERT INTO impuestos_manual (resumen_id, persona_id, moneda, centavos) VALUES (?, ?, ?, ?)", [
-        id, p.personaId, p.moneda, p.centavos,
-      ]);
-    }
-    await ejecutar(tx, "UPDATE resumenes SET criterio_impuestos = 'manual' WHERE id = ?", [id]);
-  });
+  const ids = [...new Set(partes.map((p) => p.personaId))];
+  if ((await col.personas.countDocuments({ _id: { $in: ids } })) !== ids.length) {
+    throw new Error("Alguna de las personas no existe.");
+  }
+  await col.resumenes.updateOne(
+    { _id: id },
+    {
+      $set: {
+        impuestosManual: partes
+          .filter((p) => p.centavos !== 0)
+          .map((p) => ({ personaId: p.personaId, moneda: p.moneda, centavos: p.centavos })),
+        criterioImpuestos: "manual",
+      },
+    },
+  );
 }

@@ -1,6 +1,6 @@
 "use server";
 // Server Action: este código corre en el servidor (tu compu), no en el navegador.
-// Por eso puede leer el PDF con pdf-parse y escribir en SQLite.
+// Por eso puede leer el PDF con pdf-parse y escribir en la base de datos.
 
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
