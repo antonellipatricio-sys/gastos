@@ -33,11 +33,11 @@ describe("cuentas de reparto", () => {
 
 // --- Integración con una base de datos temporal ---
 const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), "gastos-test-"));
-process.env.GASTOS_DB = path.join(carpeta, "test.db");
+process.env.DATABASE_URL = `file:${path.join(carpeta, "test.db")}`;
 
-// Importamos después de fijar GASTOS_DB para que la conexión use la base temporal.
+// Importamos después de fijar DATABASE_URL para que la conexión use la base temporal.
 const dbMod = await import("../lib/db");
-const { cerrarDb, db } = await import("../lib/db/conexion");
+const { cerrarDb, db, una } = await import("../lib/db/conexion");
 
 function resumen(cierre: string, gastos: Resumen["tarjetas"][number]["gastos"], titular = "Micaela Boggio Diaz"): Resumen {
   return {
@@ -71,8 +71,8 @@ describe("asignación al importar", () => {
       resumen("2026-08-27", [gasto("Flores", 900000, [3, 6]), gasto("Merpago*coto", 6143156)]),
     );
   });
-  afterAll(() => {
-    cerrarDb();
+  afterAll(async () => {
+    await cerrarDb();
     fs.rmSync(carpeta, { recursive: true, force: true });
   });
 
@@ -122,6 +122,6 @@ describe("asignación al importar", () => {
     const banay = (await dbMod.listarPersonas()).find((p) => p.nombre === "Banay")!;
     const asignados = await dbMod.asignarDuenioTarjeta("VISA", "8337", banay.id);
     expect(asignados).toBe(1);
-    expect(db().prepare("SELECT persona_id FROM asignaciones WHERE gasto_id = ?").get(g.id)).toEqual({ persona_id: banay.id });
+    expect(await una(await db(), "SELECT persona_id FROM asignaciones WHERE gasto_id = ?", [g.id])).toEqual({ persona_id: banay.id });
   });
 });

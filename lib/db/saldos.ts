@@ -15,7 +15,7 @@ import {
   type LineaImpuesto,
   type Totales,
 } from "../saldos";
-import { aCentavos, db } from "./conexion";
+import { aCentavos, db, todas, una } from "./conexion";
 import { pagosDePersona } from "./pagos";
 import { listarPersonas } from "./personas";
 
@@ -26,8 +26,8 @@ function fechaCorta(iso: string) {
   return `${d}/${m}/${a.slice(2)}`;
 }
 
-function idDeVos(): number {
-  const fila = db().prepare("SELECT id FROM personas ORDER BY es_yo DESC, id LIMIT 1").get() as { id: number } | undefined;
+async function idDeVos(): Promise<number> {
+  const fila = await una<{ id: number }>(await db(), "SELECT id FROM personas ORDER BY es_yo DESC, id LIMIT 1");
   if (!fila) throw new Error("No hay personas cargadas.");
   return fila.id;
 }
@@ -42,14 +42,14 @@ interface FilaResumenImpuestos {
 }
 
 /** Consumo asignado a cada persona en un resumen (sin impuestos). */
-function consumoDeResumen(resumenId: number): Map<number, Totales> {
-  const filas = db()
-    .prepare(
-      `SELECT a.persona_id, g.moneda, SUM(a.centavos) AS centavos
-       FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
-       WHERE g.resumen_id = ? GROUP BY a.persona_id, g.moneda`,
-    )
-    .all(resumenId) as { persona_id: number; moneda: Moneda; centavos: number }[];
+async function consumoDeResumen(resumenId: number): Promise<Map<number, Totales>> {
+  const filas = await todas<{ persona_id: number; moneda: Moneda; centavos: number }>(
+    await db(),
+    `SELECT a.persona_id, g.moneda, SUM(a.centavos) AS centavos
+     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
+     WHERE g.resumen_id = ? GROUP BY a.persona_id, g.moneda`,
+    [resumenId],
+  );
   const mapa = new Map<number, Totales>();
   for (const f of filas) {
     const t = mapa.get(f.persona_id) ?? cero();
@@ -59,10 +59,12 @@ function consumoDeResumen(resumenId: number): Map<number, Totales> {
   return mapa;
 }
 
-function calcularImpuestos(r: FilaResumenImpuestos, consumo: Map<number, Totales>) {
-  let lineas = db()
-    .prepare("SELECT descripcion, moneda, centavos FROM impuestos_lineas WHERE resumen_id = ? ORDER BY rowid")
-    .all(r.id) as LineaImpuesto[];
+async function calcularImpuestos(r: FilaResumenImpuestos, consumo: Map<number, Totales>) {
+  let lineas = await todas<LineaImpuesto>(
+    await db(),
+    "SELECT descripcion, moneda, centavos FROM impuestos_lineas WHERE resumen_id = ? ORDER BY rowid",
+    [r.id],
+  );
   // Resúmenes importados antes de la Fase 3: solo tenemos el total, sin el detalle por línea.
   const sinDetalle = lineas.length === 0 && (r.total_impuestos_pesos !== 0 || r.total_impuestos_dolares !== 0);
   if (sinDetalle) {
@@ -71,27 +73,29 @@ function calcularImpuestos(r: FilaResumenImpuestos, consumo: Map<number, Totales
       { descripcion: "Impuestos (total)", moneda: "USD" as const, centavos: aCentavos(r.total_impuestos_dolares) },
     ].filter((l) => l.centavos !== 0);
   }
-  const manual = db()
-    .prepare("SELECT persona_id AS personaId, moneda, centavos FROM impuestos_manual WHERE resumen_id = ?")
-    .all(r.id) as ImpuestoManual[];
-  const porPersona = repartirImpuestos({ lineas, consumo, criterio: r.criterio_impuestos, manual, yoId: idDeVos() });
+  const manual = await todas<ImpuestoManual>(
+    await db(),
+    "SELECT persona_id AS personaId, moneda, centavos FROM impuestos_manual WHERE resumen_id = ?",
+    [r.id],
+  );
+  const porPersona = repartirImpuestos({ lineas, consumo, criterio: r.criterio_impuestos, manual, yoId: await idDeVos() });
   return { criterio: r.criterio_impuestos, lineas, sinDetalle, manual, porPersona };
 }
 
 /** Impuestos de un resumen: líneas, criterio y cuánto le toca a cada persona. */
 export async function impuestosDeResumen(resumenId: number) {
-  const r = db().prepare("SELECT * FROM resumenes WHERE id = ?").get(resumenId) as FilaResumenImpuestos | undefined;
+  const r = await una<FilaResumenImpuestos>(await db(), "SELECT * FROM resumenes WHERE id = ?", [resumenId]);
   if (!r) return null;
-  return calcularImpuestos(r, consumoDeResumen(resumenId));
+  return calcularImpuestos(r, await consumoDeResumen(resumenId));
 }
 
 /** Un cargo por persona y por resumen: lo que consumió + su parte de impuestos. */
-function cargosDeTodos(): Map<number, Omit<Cargo, "tipo">[]> {
-  const resumenes = db().prepare("SELECT * FROM resumenes ORDER BY cierre, id").all() as FilaResumenImpuestos[];
+async function cargosDeTodos(): Promise<Map<number, Omit<Cargo, "tipo">[]>> {
+  const resumenes = await todas<FilaResumenImpuestos>(await db(), "SELECT * FROM resumenes ORDER BY cierre, id");
   const cargos = new Map<number, Omit<Cargo, "tipo">[]>();
   for (const r of resumenes) {
-    const consumo = consumoDeResumen(r.id);
-    const { porPersona: impuestos } = calcularImpuestos(r, consumo);
+    const consumo = await consumoDeResumen(r.id);
+    const { porPersona: impuestos } = await calcularImpuestos(r, consumo);
     for (const id of new Set([...consumo.keys(), ...impuestos.keys()])) {
       const lista = cargos.get(id) ?? [];
       lista.push({
@@ -118,8 +122,8 @@ export interface SaldoPersona {
 
 /** El saldo de cada persona: todo lo que se le asignó (con impuestos) menos todo lo que pagó. */
 export async function saldosPorPersona(): Promise<SaldoPersona[]> {
-  const cargos = cargosDeTodos();
-  const pagos = pagosDePersona(null);
+  const cargos = await cargosDeTodos();
+  const pagos = await pagosDePersona(null);
   return (await listarPersonas()).map((p) => {
     const susCargos = (cargos.get(p.id) ?? []).reduce((t, c) => sumarTotales(t, sumarTotales(c.consumo, c.impuestos)), cero());
     const susPagos = cero();
@@ -140,17 +144,10 @@ export async function cuentaDePersona(personaId: number) {
   const persona = (await listarPersonas()).find((p) => p.id === personaId);
   if (!persona) return null;
 
-  const movimientos = calcularMovimientos(cargosDeTodos().get(personaId) ?? [], pagosDePersona(personaId));
+  const movimientos = calcularMovimientos((await cargosDeTodos()).get(personaId) ?? [], await pagosDePersona(personaId));
 
   // Su parte de cada gasto, agrupada por resumen (para el detalle).
-  const filas = db()
-    .prepare(
-      `SELECT g.resumen_id, g.fecha, g.descripcion, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos,
-              (SELECT COUNT(*) FROM asignaciones a2 WHERE a2.gasto_id = g.id) > 1 AS dividido
-       FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
-       WHERE a.persona_id = ? ORDER BY g.resumen_id, g.fecha, g.id`,
-    )
-    .all(personaId) as {
+  const filas = await todas<{
     resumen_id: number;
     fecha: string;
     descripcion: string;
@@ -159,7 +156,14 @@ export async function cuentaDePersona(personaId: number) {
     moneda: Moneda;
     centavos: number;
     dividido: number;
-  }[];
+  }>(
+    await db(),
+    `SELECT g.resumen_id, g.fecha, g.descripcion, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos,
+            (SELECT COUNT(*) FROM asignaciones a2 WHERE a2.gasto_id = g.id) > 1 AS dividido
+     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id
+     WHERE a.persona_id = ? ORDER BY g.resumen_id, g.fecha, g.id`,
+    [personaId],
+  );
   const gastosPorResumen = new Map<number, GastoDelDetalle[]>();
   for (const f of filas) {
     const lista = gastosPorResumen.get(f.resumen_id) ?? [];
@@ -176,15 +180,7 @@ export async function cuentaDePersona(personaId: number) {
   }
 
   // Cuotas: solo del último resumen importado de cada tarjeta (si no, contaríamos la misma compra varias veces).
-  const cuotas = db()
-    .prepare(
-      `SELECT g.descripcion, r.tipo_tarjeta, g.ultimos_4, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos
-       FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id JOIN resumenes r ON r.id = g.resumen_id
-       WHERE a.persona_id = ? AND g.cuota_actual IS NOT NULL
-         AND r.cierre = (SELECT MAX(r2.cierre) FROM resumenes r2 WHERE r2.tipo_tarjeta = r.tipo_tarjeta)
-       ORDER BY g.cuotas_totales - g.cuota_actual DESC, g.descripcion`,
-    )
-    .all(personaId) as {
+  const cuotas = await todas<{
     descripcion: string;
     tipo_tarjeta: string;
     ultimos_4: string;
@@ -192,7 +188,15 @@ export async function cuentaDePersona(personaId: number) {
     cuotas_totales: number;
     moneda: Moneda;
     centavos: number;
-  }[];
+  }>(
+    await db(),
+    `SELECT g.descripcion, r.tipo_tarjeta, g.ultimos_4, g.cuota_actual, g.cuotas_totales, g.moneda, a.centavos
+     FROM asignaciones a JOIN gastos g ON g.id = a.gasto_id JOIN resumenes r ON r.id = g.resumen_id
+     WHERE a.persona_id = ? AND g.cuota_actual IS NOT NULL
+       AND r.cierre = (SELECT MAX(r2.cierre) FROM resumenes r2 WHERE r2.tipo_tarjeta = r.tipo_tarjeta)
+     ORDER BY g.cuotas_totales - g.cuota_actual DESC, g.descripcion`,
+    [personaId],
+  );
   const pendientes = cuotasPendientes(
     cuotas.map(
       (c): CuotaDeLaPersona => ({

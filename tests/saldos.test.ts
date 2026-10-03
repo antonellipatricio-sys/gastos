@@ -116,7 +116,7 @@ describe("movimientos, cuotas y detalle", () => {
 // --- Integración con el resumen Visa real y una base temporal ---
 const VISA = path.join(__dirname, "..", "resumenes", "visa-2026-09.pdf");
 const carpeta = fs.mkdtempSync(path.join(os.tmpdir(), "gastos-saldos-"));
-process.env.GASTOS_DB = path.join(carpeta, "test.db");
+process.env.DATABASE_URL = `file:${path.join(carpeta, "test.db")}`;
 
 describe.skipIf(!fs.existsSync(VISA))("saldos con el resumen Visa real", () => {
   let dbMod: typeof import("../lib/db");
@@ -132,7 +132,7 @@ describe.skipIf(!fs.existsSync(VISA))("saldos con el resumen Visa real", () => {
     id = (n) => personas.find((p) => p.nombre === n)!.id;
   });
   afterAll(async () => {
-    (await import("../lib/db/conexion")).cerrarDb();
+    await (await import("../lib/db/conexion")).cerrarDb();
     fs.rmSync(carpeta, { recursive: true, force: true });
   });
 

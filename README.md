@@ -1,7 +1,7 @@
 # Gastos de tarjetas
 
-App para controlar los gastos de las tarjetas de crédito (Santander Visa y American Express)
-y, más adelante, repartirlos entre las personas y saber cuánto debe cada una.
+App para controlar los gastos de las tarjetas de crédito (Santander Visa y American Express),
+repartirlos entre las personas y saber cuánto debe cada una.
 
 - **Fase 1:** subir el PDF del resumen, ver los gastos agrupados por tarjeta y validar
   que todo coincide con los subtotales del banco.
@@ -31,8 +31,11 @@ npm run dev        # levanta la app en http://localhost:3000
 npm test           # corre los tests del parser
 ```
 
-**Copia de seguridad:** con la app cerrada, copiá la carpeta `data/` entera. SQLite guarda los cambios
-recientes en `gastos.db-wal`, así que copiar solo `gastos.db` puede dejar afuera lo último.
+En tu compu no pide contraseña (salvo que definas `ADMIN_PASSWORD`, ver `.env.example`).
+
+**Copia de seguridad (local):** con la app cerrada, copiá la carpeta `data/` entera. SQLite guarda los
+cambios recientes en `gastos.db-wal`, así que copiar solo `gastos.db` puede dejar afuera lo último
+(o corré antes `npm run preparar-subida`, que los pasa a `gastos.db`).
 
 Los PDFs se pueden guardar en `resumenes/` para los tests. Esa carpeta y la base (`data/gastos.db`)
 están en `.gitignore`: **tienen datos personales y nunca se suben a GitHub**.
@@ -45,7 +48,8 @@ están en `.gitignore`: **tienen datos personales y nunca se suben a GitHub**.
 | `lib/parser/santander.ts` | Convierte el texto del PDF en tarjetas → gastos, pagos e impuestos. |
 | `lib/parser/validar.ts` | Compara lo sumado con los subtotales del banco y con el total a pagar. |
 | `lib/pdf.ts` | Saca el texto del PDF con `pdf-parse`. |
-| `lib/db/` | Única puerta a la base de datos (SQLite). Ninguna pantalla escribe SQL. `conexion.ts` crea las tablas y migra las bases viejas, y hay un archivo por tema: `resumenes`, `personas`, `asignaciones`, `saldos`, `pagos`. |
+| `lib/sesion.ts` / `proxy.ts` / `app/login/` | Login del administrador: cookie firmada; el proxy manda a `/login` a quien no tenga sesión. |
+| `lib/db/` | Única puerta a la base de datos (SQLite local o Turso, vía `@libsql/client`). Ninguna pantalla escribe SQL. `conexion.ts` crea las tablas y migra las bases viejas, y hay un archivo por tema: `resumenes`, `personas`, `asignaciones`, `saldos`, `pagos`. |
 | `lib/saldos.ts` | Cuentas de la Fase 3: reparto proporcional e impuestos, saldo acumulado, cuotas pendientes, texto del detalle. |
 | `lib/reparto.ts` | Cuentas de repartos: partes iguales sin perder centavos, heredar el reparto de una cuota, validar. |
 | `app/actions.ts` | Server Action que importa un PDF (evita importar dos veces el mismo resumen). |
@@ -58,18 +62,53 @@ Si se mira la posición en la página, la columna de montos está dibujada **en 
 El texto que entrega `pdf-parse` sigue el orden interno del archivo, donde cada fila trae su monto
 correcto, y por eso el parser lee línea por línea y no por coordenadas.
 
-## Pensada para publicarse en la web más adelante
-Lo que ya quedó preparado:
-- **El parser no depende de nada externo** (texto entra, datos salen). Sirve igual en local o en un
-  servidor, y agregar Mercado Pago es sumar otro parser al lado.
-- **Todo el acceso a datos está en `lib/db/`** y sus funciones ya son `async`, así que cambiar
-  SQLite por una base en la nube no obliga a tocar las pantallas.
-- **Montos en centavos al calcular**, para que los totales sean exactos.
+## Publicarla en la web
 
-Lo que habrá que hacer antes de publicar:
-1. **Base en la nube.** Un archivo SQLite no sirve en hostings como Vercel, porque su disco se borra.
-   Opciones: **Turso** (SQLite en la nube, el cambio más chico) o **Postgres** (Neon, Supabase).
-2. **Login.** Son datos financieros: sin autenticación no se publica. Por ejemplo, Auth.js o Clerk.
-3. **Multiusuario.** Agregar `usuario_id` a `resumenes` (y a las tablas futuras) y filtrar
-   todas las consultas por el usuario logueado.
-4. **No guardar los PDFs**: hoy solo se lee el texto y se descarta el archivo. Mantenerlo así.
+La app tiene **un solo usuario: el administrador**. Nadie más entra; a cada persona se le manda
+su detalle por WhatsApp. Se publica en **Vercel** (el hosting) con la base en **Turso** (SQLite en la nube).
+
+### Cómo está protegida
+- Toda página y toda acción pide sesión. La contraseña es `ADMIN_PASSWORD`; al entrar se guarda una
+  cookie firmada (HMAC con `SESSION_SECRET`) que dura 30 días. "Salir" la borra.
+- Cambiar `ADMIN_PASSWORD` cierra todas las sesiones abiertas.
+- Cada intento con contraseña incorrecta tarda 1 segundo (frena a quien quiera adivinarla).
+- **Si se publica sin `ADMIN_PASSWORD` o con un `SESSION_SECRET` de menos de 32 caracteres, la app
+  se bloquea entera** y muestra qué falta configurar. Nunca queda abierta por un olvido.
+- Los PDFs se leen en memoria y no se guardan en ningún lado.
+
+### Paso a paso (una sola vez)
+1. **Subí tu base a Turso** (así no perdés nada de lo cargado):
+   ```bash
+   # con la app cerrada
+   npm run preparar-subida
+   # instalar la CLI de Turso: https://docs.turso.tech/cli/installation
+   turso auth signup                    # o `turso auth login` si ya tenés cuenta
+   turso db create gastos --from-file data/gastos.db
+   turso db show gastos --url           # → DATABASE_URL
+   turso db tokens create gastos        # → DATABASE_AUTH_TOKEN
+   ```
+2. **Generá el secreto de sesión:**
+   ```bash
+   node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+   ```
+3. **Creá el proyecto en Vercel** (vercel.com → Add New → Project → importar el repo `gastos` de GitHub)
+   y en *Environment Variables* cargá: `DATABASE_URL`, `DATABASE_AUTH_TOKEN`, `ADMIN_PASSWORD` (una
+   contraseña larga) y `SESSION_SECRET`. Deploy.
+4. Listo. **Cada push a `main` publica una versión nueva sola.**
+
+Desde que publicás, **la base de verdad es la de Turso**: lo que cargues en tu compu (en `data/`) ya
+no se ve en la web. Si querés usar tu compu contra la misma base, poné `DATABASE_URL` y
+`DATABASE_AUTH_TOKEN` en un archivo `.env.local` (está en `.gitignore`).
+
+### Copia de seguridad (Turso)
+```bash
+turso db shell gastos .dump > backup-$(date +%F).sql
+```
+Guardala fuera del repo: tiene tus datos.
+
+## Pensada para crecer
+- **El parser no depende de nada externo** (texto entra, datos salen): agregar Mercado Pago es sumar
+  otro parser al lado.
+- **Todo el acceso a datos está en `lib/db/`** (con `@libsql/client`, que habla igual con un archivo
+  local o con Turso): las pantallas no saben dónde vive la base.
+- **Montos en centavos al calcular**, para que los totales sean exactos.
