@@ -33,6 +33,7 @@ export default async function Inicio() {
                   </span>
                   <span className="text-sm text-slate-600">
                     {r.cantidad_gastos} gastos
+                    {r.sin_asignar > 0 && <span className="text-amber-700"> ({r.sin_asignar} sin asignar)</span>}
                     {r.total_a_pagar_pesos !== null &&
                       ` · total ${formatear(Math.round(r.total_a_pagar_pesos * 100), "ARS")}`}
                   </span>

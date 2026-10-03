@@ -79,3 +79,18 @@ export function formatear(centavos: number, moneda: Moneda): string {
   });
   return `${centavos < 0 ? "-" : ""}${moneda === "USD" ? "U$S" : "$"} ${texto}`;
 }
+
+/**
+ * Lo que escribe una persona en un campo de monto: "1.234,56", "1234,56", "1234.56" o "1234".
+ * Devuelve centavos, o null si no es un número válido.
+ */
+export function leerImporte(texto: string): number | null {
+  const t = texto.trim().replace(/^\$\s*/, "");
+  if (!/^-?[\d.,]+$/.test(t)) return null;
+  // Con coma, o con puntos en grupos de 3 ("1.234"): formato argentino, los puntos son de miles.
+  // Si no, un punto suelto es decimal ("1234.56").
+  const argentino = t.includes(",") || /^-?\d{1,3}(\.\d{3})+$/.test(t);
+  const normal = argentino ? t.replace(/\./g, "").replace(",", ".") : t;
+  const valor = Number(normal);
+  return Number.isFinite(valor) ? Math.round(valor * 100) : null;
+}

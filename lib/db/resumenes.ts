@@ -1,85 +1,14 @@
-// Conexión a SQLite. La base es un único archivo: data/gastos.db (en .gitignore).
-import Database from "better-sqlite3";
-import fs from "node:fs";
-import path from "node:path";
-import type { Resumen, Totales } from "./parser/santander";
-import type { DatosValidacion } from "./parser/validar";
-
-const CARPETA = path.join(process.cwd(), "data");
-const ARCHIVO = path.join(CARPETA, "gastos.db");
-
-// "CREATE TABLE IF NOT EXISTS" hace que esto se pueda correr siempre: la primera vez
-// crea las tablas y las siguientes no hace nada.
-const ESQUEMA = `
-CREATE TABLE IF NOT EXISTS resumenes (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  tipo_tarjeta TEXT NOT NULL,            -- 'VISA' | 'AMEX'
-  periodo TEXT NOT NULL,                 -- '30/07/26 – 27/08/26'
-  cierre TEXT NOT NULL,                  -- ISO '2026-08-27'
-  vencimiento TEXT NOT NULL,
-  total_impuestos_pesos REAL NOT NULL DEFAULT 0,
-  total_impuestos_dolares REAL NOT NULL DEFAULT 0,
-  -- Totales de control (para poder re-mostrar la validación sin el PDF)
-  total_pagos_pesos REAL NOT NULL DEFAULT 0,
-  total_pagos_dolares REAL NOT NULL DEFAULT 0,
-  saldo_anterior_pesos REAL,
-  saldo_anterior_dolares REAL,
-  total_a_pagar_pesos REAL,
-  total_a_pagar_dolares REAL,
-  importado_en TEXT NOT NULL DEFAULT (datetime('now')),
-  -- Un mismo resumen no se puede importar dos veces
-  UNIQUE (tipo_tarjeta, cierre)
-);
-
-CREATE TABLE IF NOT EXISTS gastos (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  titular TEXT NOT NULL,
-  ultimos_4 TEXT NOT NULL,
-  fecha TEXT NOT NULL,                   -- ISO '2026-08-05'
-  descripcion TEXT NOT NULL,
-  cuota_actual INTEGER,
-  cuotas_totales INTEGER,
-  comprobante TEXT,
-  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
-  monto REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS gastos_resumen ON gastos(resumen_id);
-
--- Lo que dice el banco en "Subtotal de X", por tarjeta (para la validación)
-CREATE TABLE IF NOT EXISTS subtotales (
-  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
-  ultimos_4 TEXT NOT NULL,
-  titular TEXT NOT NULL,
-  pesos REAL,
-  dolares REAL,
-  PRIMARY KEY (resumen_id, ultimos_4)
-);
-`;
-
-// En desarrollo Next recarga los módulos seguido; guardamos la conexión en globalThis
-// para no abrir una nueva en cada recarga.
-const global = globalThis as unknown as { __db?: Database.Database };
-
-export function db(): Database.Database {
-  if (!global.__db) {
-    fs.mkdirSync(CARPETA, { recursive: true });
-    const conexion = new Database(ARCHIVO);
-    conexion.pragma("journal_mode = WAL");
-    conexion.pragma("foreign_keys = ON");
-    conexion.exec(ESQUEMA);
-    global.__db = conexion;
-  }
-  return global.__db;
-}
+// Importar y leer resúmenes.
+import type { Resumen, Totales } from "../parser/santander";
+import type { DatosValidacion } from "../parser/validar";
+import { mismoNombre, type Parte } from "../reparto";
+import { guardarPartes, partesDeResumen, repartoAutomatico } from "./asignaciones";
+import { aCentavos, aPesos, db } from "./conexion";
 
 // Todas las funciones de acceso a datos son async aunque better-sqlite3 sea sincrónico:
 // el día que la app se publique con una base en la nube (Postgres, Turso), las consultas
 // van a ser asincrónicas y así las pantallas no hay que tocarlas.
 
-// --- Conversión centavos (parser) ↔ pesos (base) ---
-const aPesos = (centavos: number) => centavos / 100;
-const aCentavos = (pesos: number) => Math.round(pesos * 100);
 const totalesDe = (ars: number | null, usd: number | null): Totales | null =>
   ars === null || usd === null ? null : { ARS: aCentavos(ars), USD: aCentavos(usd) };
 
@@ -118,7 +47,10 @@ export async function buscarResumen(tipo: string, cierre: string): Promise<{ id:
     .get(tipo, cierre) as { id: number } | undefined;
 }
 
-/** Guarda el resumen y todos sus gastos en UNA transacción: o se guarda todo, o nada. */
+/**
+ * Guarda el resumen, sus gastos y el reparto automático en UNA transacción:
+ * o se guarda todo, o nada.
+ */
 export async function guardarResumen(r: Resumen): Promise<number> {
   const conexion = db();
   const guardar = conexion.transaction(() => {
@@ -147,17 +79,49 @@ export async function guardarResumen(r: Resumen): Promise<number> {
     const insertarSubtotal = conexion.prepare(
       "INSERT INTO subtotales (resumen_id, ultimos_4, titular, pesos, dolares) VALUES (?, ?, ?, ?, ?)",
     );
+    const personas = conexion.prepare("SELECT id, nombre FROM personas").all() as { id: number; nombre: string }[];
+
     for (const t of r.tarjetas) {
       insertarSubtotal.run(
         resumenId, t.ultimos4, t.titular,
         t.subtotalBanco ? aPesos(t.subtotalBanco.ARS) : null,
         t.subtotalBanco ? aPesos(t.subtotalBanco.USD) : null,
       );
+
+      // Primera vez que vemos esta tarjeta: la registramos y sugerimos dueño por el nombre del titular.
+      let tarjeta = conexion
+        .prepare("SELECT persona_id FROM tarjetas WHERE tipo_tarjeta = ? AND ultimos_4 = ?")
+        .get(r.tipo, t.ultimos4) as { persona_id: number | null } | undefined;
+      if (!tarjeta) {
+        const sugerida = personas.find((p) => mismoNombre(t.titular, p.nombre))?.id ?? null;
+        conexion
+          .prepare("INSERT INTO tarjetas (tipo_tarjeta, ultimos_4, titular, persona_id) VALUES (?, ?, ?, ?)")
+          .run(r.tipo, t.ultimos4, t.titular, sugerida);
+        tarjeta = { persona_id: sugerida };
+      }
+
       for (const g of t.gastos) {
-        insertarGasto.run(
+        const { lastInsertRowid: gastoId } = insertarGasto.run(
           resumenId, t.titular, t.ultimos4, g.fecha, g.descripcion, g.cuotaActual,
           g.cuotasTotales, g.comprobante, g.moneda, aPesos(g.centavos),
         );
+        const partes = repartoAutomatico(
+          conexion,
+          {
+            id: Number(gastoId),
+            tipoTarjeta: r.tipo,
+            cierre: r.cierre,
+            ultimos4: t.ultimos4,
+            descripcion: g.descripcion,
+            cuotaActual: g.cuotaActual,
+            cuotasTotales: g.cuotasTotales,
+            comprobante: g.comprobante,
+            moneda: g.moneda,
+            centavos: g.centavos,
+          },
+          tarjeta.persona_id,
+        );
+        guardarPartes(conexion, Number(gastoId), partes);
       }
     }
     return resumenId;
@@ -165,21 +129,27 @@ export async function guardarResumen(r: Resumen): Promise<number> {
   return guardar();
 }
 
-export async function listarResumenes(): Promise<(FilaResumen & { cantidad_gastos: number })[]> {
+export async function listarResumenes(): Promise<(FilaResumen & { cantidad_gastos: number; sin_asignar: number })[]> {
   return db()
     .prepare(
-      `SELECT r.*, (SELECT COUNT(*) FROM gastos g WHERE g.resumen_id = r.id) AS cantidad_gastos
+      `SELECT r.*,
+         (SELECT COUNT(*) FROM gastos g WHERE g.resumen_id = r.id) AS cantidad_gastos,
+         (SELECT COUNT(*) FROM gastos g WHERE g.resumen_id = r.id
+            AND NOT EXISTS (SELECT 1 FROM asignaciones a WHERE a.gasto_id = g.id)) AS sin_asignar
        FROM resumenes r ORDER BY r.cierre DESC, r.tipo_tarjeta`,
     )
-    .all() as (FilaResumen & { cantidad_gastos: number })[];
+    .all() as (FilaResumen & { cantidad_gastos: number; sin_asignar: number })[];
 }
+
+export type GastoConPartes = FilaGasto & { partes: Parte[] };
 
 export async function obtenerResumen(id: number) {
   const resumen = db().prepare("SELECT * FROM resumenes WHERE id = ?").get(id) as FilaResumen | undefined;
   if (!resumen) return null;
-  const gastos = db()
-    .prepare("SELECT * FROM gastos WHERE resumen_id = ? ORDER BY id")
-    .all(id) as FilaGasto[];
+  const partes = partesDeResumen(id);
+  const gastos: GastoConPartes[] = (
+    db().prepare("SELECT * FROM gastos WHERE resumen_id = ? ORDER BY id").all(id) as FilaGasto[]
+  ).map((g) => ({ ...g, partes: partes.get(g.id) ?? [] }));
   const subtotales = db()
     .prepare("SELECT * FROM subtotales WHERE resumen_id = ? ORDER BY rowid")
     .all(id) as { ultimos_4: string; titular: string; pesos: number | null; dolares: number | null }[];
@@ -198,6 +168,18 @@ export async function obtenerResumen(id: number) {
     };
   });
 
+  // Totales por persona en este resumen (y lo que quedó sin asignar).
+  const porPersona = new Map<number, Totales>();
+  const sinAsignar: Totales = { ARS: 0, USD: 0 };
+  for (const g of gastos) {
+    if (g.partes.length === 0) sinAsignar[g.moneda] += aCentavos(g.monto);
+    for (const p of g.partes) {
+      const t = porPersona.get(p.personaId) ?? { ARS: 0, USD: 0 };
+      t[g.moneda] += p.centavos;
+      porPersona.set(p.personaId, t);
+    }
+  }
+
   const validacion: DatosValidacion = {
     tarjetas,
     totalPagos: { ARS: aCentavos(resumen.total_pagos_pesos), USD: aCentavos(resumen.total_pagos_dolares) },
@@ -205,5 +187,5 @@ export async function obtenerResumen(id: number) {
     totalImpuestos: { ARS: aCentavos(resumen.total_impuestos_pesos), USD: aCentavos(resumen.total_impuestos_dolares) },
     totalAPagarBanco: totalesDe(resumen.total_a_pagar_pesos, resumen.total_a_pagar_dolares),
   };
-  return { resumen, tarjetas, validacion };
+  return { resumen, tarjetas, validacion, porPersona, sinAsignar };
 }

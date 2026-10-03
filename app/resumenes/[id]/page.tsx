@@ -1,8 +1,9 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { obtenerResumen } from "@/lib/db";
+import { listarPersonas, obtenerResumen } from "@/lib/db";
 import { fechaCorta, formatear } from "@/lib/parser/montos";
 import { validar, type Control } from "@/lib/parser/validar";
+import { AsignarGasto } from "./asignar-gasto";
 
 export const dynamic = "force-dynamic";
 
@@ -35,9 +36,11 @@ function FilaControl({ c }: { c: Control }) {
 
 export default async function DetalleResumen({ params }: PageProps<"/resumenes/[id]">) {
   const { id } = await params;
-  const datos = await obtenerResumen(Number(id));
+  const [datos, personas] = await Promise.all([obtenerResumen(Number(id)), listarPersonas()]);
   if (!datos) notFound();
-  const { resumen, tarjetas, validacion } = datos;
+  const { resumen, tarjetas, validacion, porPersona, sinAsignar } = datos;
+  const opciones = personas.map((p) => ({ id: p.id, nombre: p.nombre }));
+  const haySinAsignar = sinAsignar.ARS !== 0 || sinAsignar.USD !== 0;
   const controles = validar(validacion);
   const todoOk = controles.every((c) => c.ok);
 
@@ -59,6 +62,30 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
         </h2>
         <ul className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200">
           {controles.map((c) => <FilaControl key={c.nombre} c={c} />)}
+        </ul>
+      </section>
+
+      <section className="space-y-2">
+        <h2 className="text-lg font-semibold">Por persona</h2>
+        <p className="text-sm text-slate-600">
+          Consumos de este resumen según a quién está asignado cada gasto (sin pagos ni impuestos).{" "}
+          <Link href="/personas" className="underline">Editar personas y tarjetas</Link>
+        </p>
+        <ul className="grid gap-2 sm:grid-cols-3">
+          {personas
+            .filter((p) => porPersona.has(p.id))
+            .map((p) => (
+              <li key={p.id} className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
+                <div className="font-medium">{p.nombre}</div>
+                <Totales {...porPersona.get(p.id)!} />
+              </li>
+            ))}
+          {haySinAsignar && (
+            <li className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm">
+              <div className="font-medium">Sin asignar</div>
+              <Totales {...sinAsignar} />
+            </li>
+          )}
         </ul>
       </section>
 
@@ -91,6 +118,7 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
                   <th className="px-3 py-1.5 font-medium">Comprobante</th>
                   <th className="px-3 py-1.5 text-right font-medium">Pesos</th>
                   <th className="px-3 py-1.5 text-right font-medium">Dólares</th>
+                  <th className="px-3 py-1.5 font-medium">De quién</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
@@ -109,6 +137,15 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
                       </td>
                       <td className="whitespace-nowrap px-3 py-1.5 text-right tabular-nums">
                         {g.moneda === "USD" ? formatear(centavos, "USD") : ""}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <AsignarGasto
+                          gastoId={g.id}
+                          centavos={centavos}
+                          moneda={g.moneda}
+                          partes={g.partes}
+                          personas={opciones}
+                        />
                       </td>
                     </tr>
                   );
