@@ -41,6 +41,12 @@ export interface Tarjeta {
   subtotalBanco: Totales | null;
 }
 
+export interface LineaImpuesto {
+  descripcion: string;
+  moneda: Moneda;
+  centavos: number;
+}
+
 export interface Resumen {
   tipo: TipoTarjeta;
   /** "30/07/26 – 27/08/26": desde el cierre anterior hasta el cierre actual. */
@@ -54,6 +60,8 @@ export interface Resumen {
   saldoAnteriorBanco: Totales | null;
   /** Suma de las líneas de "Impuestos, intereses y percepciones". */
   totalImpuestos: Totales;
+  /** Cada línea de "Impuestos, intereses y percepciones" (para repartirlas según su origen). */
+  impuestos: LineaImpuesto[];
   /** "Total a pagar" del banco. */
   totalAPagarBanco: Totales | null;
   /** Líneas que el parser no supo interpretar (para avisar en pantalla). */
@@ -115,6 +123,7 @@ export function parsearResumen(texto: string): Resumen {
     totalPagos: { ARS: 0, USD: 0 },
     saldoAnteriorBanco: null,
     totalImpuestos: { ARS: 0, USD: 0 },
+    impuestos: [],
     totalAPagarBanco: null,
     advertencias: [],
   };
@@ -191,7 +200,14 @@ export function parsearResumen(texto: string): Resumen {
     // --- Contenido de cada sección ---
     if (seccion === "pagos" || seccion === "impuestos") {
       const separado = separarMontosAlFinal(linea);
-      if (separado) (seccion === "pagos" ? montosPagos : montosImpuestos).push(...separado.montos);
+      if (!separado) continue;
+      if (seccion === "pagos") {
+        montosPagos.push(...separado.montos);
+      } else {
+        montosImpuestos.push(...separado.montos);
+        const descripcion = separado.resto.replace(FECHA, "").trim();
+        for (const m of separado.montos) resumen.impuestos.push({ descripcion, moneda: m.moneda, centavos: m.centavos });
+      }
       continue;
     }
 

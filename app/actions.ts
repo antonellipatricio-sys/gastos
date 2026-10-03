@@ -7,13 +7,19 @@ import { redirect } from "next/navigation";
 import {
   asignarDuenioTarjeta,
   asignarGasto,
+  borrarPago,
+  borrarResumen,
   buscarResumen,
+  cambiarCriterioImpuestos,
   crearPersona,
   eliminarPersona,
+  guardarImpuestosManual,
   guardarResumen,
+  registrarPago,
   renombrarPersona,
 } from "@/lib/db";
 import type { Parte } from "@/lib/reparto";
+import type { CriterioImpuestos, ImpuestoManual } from "@/lib/saldos";
 import { extraerTexto } from "@/lib/pdf";
 import { parsearResumen } from "@/lib/parser/santander";
 
@@ -62,7 +68,7 @@ type Resultado = { error?: string };
 function mensaje(e: unknown): string {
   const texto = e instanceof Error ? e.message : String(e);
   if (texto.includes("UNIQUE")) return "Ya existe una persona con ese nombre.";
-  if (texto.includes("FOREIGN KEY")) return "Esa persona tiene gastos asignados: reasignalos antes de borrarla.";
+  if (texto.includes("FOREIGN KEY")) return "Esa persona tiene gastos o pagos cargados: no se puede borrar.";
   return texto;
 }
 
@@ -127,6 +133,84 @@ export async function asignarGastoAccion(gastoId: number, partes: Parte[]): Prom
   } catch (e) {
     return { error: mensaje(e) };
   }
+  revalidatePath("/", "layout");
+  return {};
+}
+
+// ===== Fase 3: impuestos, resúmenes y pagos =====
+
+const CRITERIOS: CriterioImpuestos[] = ["proporcional", "yo", "manual"];
+const esMoneda = (m: unknown): m is "ARS" | "USD" => m === "ARS" || m === "USD";
+
+export async function cambiarCriterioAccion(resumenId: number, criterio: CriterioImpuestos): Promise<Resultado> {
+  if (!esId(resumenId) || !CRITERIOS.includes(criterio)) return { error: "Datos inválidos." };
+  await cambiarCriterioImpuestos(resumenId, criterio);
+  revalidatePath("/", "layout");
+  return {};
+}
+
+export async function guardarImpuestosManualAccion(resumenId: number, partes: ImpuestoManual[]): Promise<Resultado> {
+  if (
+    !esId(resumenId) ||
+    !Array.isArray(partes) ||
+    partes.some((p) => !esId(p.personaId) || !esMoneda(p.moneda) || !Number.isInteger(p.centavos))
+  ) {
+    return { error: "Datos inválidos." };
+  }
+  try {
+    await guardarImpuestosManual(resumenId, partes);
+  } catch (e) {
+    return { error: mensaje(e) };
+  }
+  revalidatePath("/", "layout");
+  return {};
+}
+
+export async function borrarResumenAccion(resumenId: number): Promise<Resultado> {
+  if (!esId(resumenId)) return { error: "Resumen inválido." };
+  await borrarResumen(resumenId);
+  revalidatePath("/", "layout");
+  redirect("/");
+}
+
+export interface DatosPago {
+  personaId: number;
+  fecha: string; // ISO
+  moneda: "ARS" | "USD";
+  centavos: number;
+  pagadoEnPesos: number | null;
+  tipoCambio: number | null;
+  nota: string;
+}
+
+export async function registrarPagoAccion(d: DatosPago): Promise<Resultado> {
+  if (!esId(d.personaId) || !esMoneda(d.moneda)) return { error: "Datos inválidos." };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d.fecha)) return { error: "La fecha no es válida." };
+  if (!Number.isInteger(d.centavos) || d.centavos <= 0) return { error: "El monto tiene que ser mayor a cero." };
+  const enPesos = d.pagadoEnPesos !== null;
+  if (enPesos && (d.moneda !== "USD" || !Number.isInteger(d.pagadoEnPesos) || !(d.tipoCambio! > 0))) {
+    return { error: "Para un pago en pesos de una deuda en dólares, indicá los pesos y la cotización." };
+  }
+  try {
+    await registrarPago({
+      personaId: d.personaId,
+      fecha: d.fecha,
+      moneda: d.moneda,
+      centavos: d.centavos,
+      pagadoEnPesos: enPesos ? d.pagadoEnPesos : null,
+      tipoCambio: enPesos ? d.tipoCambio : null,
+      nota: d.nota.trim() || null,
+    });
+  } catch (e) {
+    return { error: mensaje(e) };
+  }
+  revalidatePath("/", "layout");
+  return {};
+}
+
+export async function borrarPagoAccion(pagoId: number): Promise<Resultado> {
+  if (!esId(pagoId)) return { error: "Pago inválido." };
+  await borrarPago(pagoId);
   revalidatePath("/", "layout");
   return {};
 }

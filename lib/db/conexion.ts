@@ -83,7 +83,50 @@ CREATE TABLE IF NOT EXISTS asignaciones (
   PRIMARY KEY (gasto_id, persona_id)
 );
 CREATE INDEX IF NOT EXISTS asignaciones_persona ON asignaciones(persona_id);
+
+-- ===== Fase 3 =====
+
+-- Cada línea de "Impuestos, intereses y percepciones" (para repartirlas según su origen).
+CREATE TABLE IF NOT EXISTS impuestos_lineas (
+  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
+  descripcion TEXT NOT NULL,
+  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
+  centavos INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS impuestos_lineas_resumen ON impuestos_lineas(resumen_id);
+
+-- Reparto de impuestos cargado a mano (solo cuando el resumen usa el criterio 'manual').
+CREATE TABLE IF NOT EXISTS impuestos_manual (
+  resumen_id INTEGER NOT NULL REFERENCES resumenes(id) ON DELETE CASCADE,
+  persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE RESTRICT,
+  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
+  centavos INTEGER NOT NULL,
+  PRIMARY KEY (resumen_id, persona_id, moneda)
+);
+
+-- Pagos que te hace cada persona. "moneda" + "centavos" = qué deuda cancela.
+-- Si te pagó dólares con pesos, se guarda además cuántos pesos dio y a qué cotización.
+CREATE TABLE IF NOT EXISTS pagos (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  persona_id INTEGER NOT NULL REFERENCES personas(id) ON DELETE RESTRICT,
+  fecha TEXT NOT NULL,                   -- ISO '2026-09-05'
+  moneda TEXT NOT NULL CHECK (moneda IN ('ARS', 'USD')),
+  centavos INTEGER NOT NULL CHECK (centavos > 0),
+  pagado_en_pesos_centavos INTEGER,
+  tipo_cambio REAL,
+  nota TEXT,
+  creado_en TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS pagos_persona ON pagos(persona_id);
 `;
+
+/** Agrega una columna a una tabla existente si todavía no la tiene (SQLite no tiene "ADD COLUMN IF NOT EXISTS"). */
+function agregarColumna(conexion: Database.Database, tabla: string, columna: string, definicion: string) {
+  const columnas = conexion.prepare(`PRAGMA table_info(${tabla})`).all() as { name: string }[];
+  if (!columnas.some((c) => c.name === columna)) {
+    conexion.exec(`ALTER TABLE ${tabla} ADD COLUMN ${columna} ${definicion}`);
+  }
+}
 
 // Las personas que se cargan la primera vez (después se pueden editar desde la app).
 const PERSONAS_INICIALES: { nombre: string; esYo: boolean }[] = [
@@ -110,6 +153,8 @@ export function db(): Database.Database {
     conexion.pragma("journal_mode = WAL");
     conexion.pragma("foreign_keys = ON");
     conexion.exec(ESQUEMA);
+    // Fase 3: cómo se reparten los impuestos de cada resumen ('proporcional' | 'yo' | 'manual').
+    agregarColumna(conexion, "resumenes", "criterio_impuestos", "TEXT NOT NULL DEFAULT 'proporcional'");
 
     const hayPersonas = conexion.prepare("SELECT COUNT(*) AS n FROM personas").get() as { n: number };
     if (hayPersonas.n === 0) {

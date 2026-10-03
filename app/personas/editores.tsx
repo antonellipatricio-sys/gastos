@@ -1,6 +1,7 @@
 "use client";
 // Componentes con interacción (escribir, borrar, elegir) para la pantalla de personas.
 
+import Link from "next/link";
 import { useState, useTransition } from "react";
 import {
   asignarDuenioAccion,
@@ -41,6 +42,7 @@ function FilaPersona({ persona }: { persona: Persona }) {
         />
         {persona.es_yo === 1 && <span className="rounded bg-slate-100 px-2 py-0.5 text-xs">vos</span>}
         <span className="text-sm text-slate-500">{persona.cantidad_asignaciones} gastos asignados</span>
+        <Link href={`/personas/${persona.id}`} className="text-sm underline">ver cuenta</Link>
         <span className="ml-auto flex gap-2">
           {cambio && (
             <button onClick={guardar} disabled={pendiente} className="rounded bg-slate-900 px-3 py-1 text-sm text-white">

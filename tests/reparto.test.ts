@@ -49,6 +49,7 @@ function resumen(cierre: string, gastos: Resumen["tarjetas"][number]["gastos"], 
     totalPagos: { ARS: 0, USD: 0 },
     saldoAnteriorBanco: null,
     totalImpuestos: { ARS: 0, USD: 0 },
+    impuestos: [],
     totalAPagarBanco: null,
     advertencias: [],
   };

@@ -15,6 +15,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           <nav className="mx-auto flex max-w-6xl items-center gap-6 px-4 py-3">
             <Link href="/" className="font-semibold">💳 Gastos de tarjetas</Link>
             <Link href="/" className="text-sm text-slate-600 hover:text-slate-900">Resúmenes</Link>
+            <Link href="/saldos" className="text-sm text-slate-600 hover:text-slate-900">Saldos</Link>
             <Link href="/personas" className="text-sm text-slate-600 hover:text-slate-900">Personas y tarjetas</Link>
           </nav>
         </header>

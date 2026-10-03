@@ -2,6 +2,7 @@
 import type { Resumen, Totales } from "../parser/santander";
 import type { DatosValidacion } from "../parser/validar";
 import { mismoNombre, type Parte } from "../reparto";
+import type { CriterioImpuestos, ImpuestoManual } from "../saldos";
 import { guardarPartes, partesDeResumen, repartoAutomatico } from "./asignaciones";
 import { aCentavos, aPesos, db } from "./conexion";
 
@@ -26,6 +27,7 @@ export interface FilaResumen {
   saldo_anterior_dolares: number | null;
   total_a_pagar_pesos: number | null;
   total_a_pagar_dolares: number | null;
+  criterio_impuestos: CriterioImpuestos;
 }
 
 export interface FilaGasto {
@@ -80,6 +82,11 @@ export async function guardarResumen(r: Resumen): Promise<number> {
       "INSERT INTO subtotales (resumen_id, ultimos_4, titular, pesos, dolares) VALUES (?, ?, ?, ?, ?)",
     );
     const personas = conexion.prepare("SELECT id, nombre FROM personas").all() as { id: number; nombre: string }[];
+
+    const insertarImpuesto = conexion.prepare(
+      "INSERT INTO impuestos_lineas (resumen_id, descripcion, moneda, centavos) VALUES (?, ?, ?, ?)",
+    );
+    for (const i of r.impuestos) insertarImpuesto.run(resumenId, i.descripcion, i.moneda, i.centavos);
 
     for (const t of r.tarjetas) {
       insertarSubtotal.run(
@@ -188,4 +195,41 @@ export async function obtenerResumen(id: number) {
     totalAPagarBanco: totalesDe(resumen.total_a_pagar_pesos, resumen.total_a_pagar_dolares),
   };
   return { resumen, tarjetas, validacion, porPersona, sinAsignar };
+}
+
+/** Borra un resumen con todo lo suyo (gastos, repartos, impuestos), por ejemplo para reimportarlo. */
+export async function borrarResumen(id: number): Promise<void> {
+  db().prepare("DELETE FROM resumenes WHERE id = ?").run(id);
+}
+
+export async function cambiarCriterioImpuestos(id: number, criterio: CriterioImpuestos): Promise<void> {
+  db().prepare("UPDATE resumenes SET criterio_impuestos = ? WHERE id = ?").run(criterio, id);
+}
+
+/**
+ * Guarda el reparto manual de impuestos y pasa el resumen a criterio 'manual'.
+ * Por cada moneda, las partes tienen que sumar exactamente el total de impuestos del resumen.
+ */
+export async function guardarImpuestosManual(id: number, partes: ImpuestoManual[]): Promise<void> {
+  const conexion = db();
+  const r = conexion
+    .prepare("SELECT total_impuestos_pesos, total_impuestos_dolares FROM resumenes WHERE id = ?")
+    .get(id) as { total_impuestos_pesos: number; total_impuestos_dolares: number } | undefined;
+  if (!r) throw new Error("El resumen no existe.");
+  const total = { ARS: aCentavos(r.total_impuestos_pesos), USD: aCentavos(r.total_impuestos_dolares) };
+  for (const moneda of ["ARS", "USD"] as const) {
+    const suma = partes.filter((p) => p.moneda === moneda).reduce((s, p) => s + p.centavos, 0);
+    if (suma !== total[moneda]) {
+      const f = (c: number) => (c / 100).toLocaleString("es-AR", { minimumFractionDigits: 2 });
+      throw new Error(`Los impuestos en ${moneda === "ARS" ? "pesos" : "dólares"} suman ${f(suma)} y deberían sumar ${f(total[moneda])}.`);
+    }
+  }
+  conexion.transaction(() => {
+    conexion.prepare("DELETE FROM impuestos_manual WHERE resumen_id = ?").run(id);
+    const insertar = conexion.prepare(
+      "INSERT INTO impuestos_manual (resumen_id, persona_id, moneda, centavos) VALUES (?, ?, ?, ?)",
+    );
+    for (const p of partes) if (p.centavos !== 0) insertar.run(id, p.personaId, p.moneda, p.centavos);
+    conexion.prepare("UPDATE resumenes SET criterio_impuestos = 'manual' WHERE id = ?").run(id);
+  })();
 }

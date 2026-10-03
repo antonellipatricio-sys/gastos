@@ -1,9 +1,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { listarPersonas, obtenerResumen } from "@/lib/db";
+import { impuestosDeResumen, listarPersonas, obtenerResumen } from "@/lib/db";
 import { fechaCorta, formatear } from "@/lib/parser/montos";
 import { validar, type Control } from "@/lib/parser/validar";
 import { AsignarGasto } from "./asignar-gasto";
+import { BorrarResumen, Impuestos } from "./impuestos";
 
 export const dynamic = "force-dynamic";
 
@@ -36,8 +37,13 @@ function FilaControl({ c }: { c: Control }) {
 
 export default async function DetalleResumen({ params }: PageProps<"/resumenes/[id]">) {
   const { id } = await params;
-  const [datos, personas] = await Promise.all([obtenerResumen(Number(id)), listarPersonas()]);
-  if (!datos) notFound();
+  const [datos, personas, impuestos] = await Promise.all([
+    obtenerResumen(Number(id)),
+    listarPersonas(),
+    impuestosDeResumen(Number(id)),
+  ]);
+  if (!datos || !impuestos) notFound();
+  const cero = { ARS: 0, USD: 0 };
   const { resumen, tarjetas, validacion, porPersona, sinAsignar } = datos;
   const opciones = personas.map((p) => ({ id: p.id, nombre: p.nombre }));
   const haySinAsignar = sinAsignar.ARS !== 0 || sinAsignar.USD !== 0;
@@ -68,18 +74,34 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
       <section className="space-y-2">
         <h2 className="text-lg font-semibold">Por persona</h2>
         <p className="text-sm text-slate-600">
-          Consumos de este resumen según a quién está asignado cada gasto (sin pagos ni impuestos).{" "}
+          Lo que le toca a cada uno en este resumen: sus consumos más su parte de impuestos.{" "}
           <Link href="/personas" className="underline">Editar personas y tarjetas</Link>
         </p>
         <ul className="grid gap-2 sm:grid-cols-3">
           {personas
-            .filter((p) => porPersona.has(p.id))
-            .map((p) => (
-              <li key={p.id} className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
-                <div className="font-medium">{p.nombre}</div>
-                <Totales {...porPersona.get(p.id)!} />
-              </li>
-            ))}
+            .filter((p) => porPersona.has(p.id) || impuestos.porPersona.has(p.id))
+            .map((p) => {
+              const consumo = porPersona.get(p.id) ?? cero;
+              const imp = impuestos.porPersona.get(p.id) ?? cero;
+              return (
+                <li key={p.id} className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
+                  <div className="flex justify-between font-medium">
+                    {p.nombre}
+                    {p.es_yo !== 1 && (
+                      <Link href={`/personas/${p.id}`} className="text-xs font-normal text-slate-500 underline">
+                        ver cuenta
+                      </Link>
+                    )}
+                  </div>
+                  <div className="font-medium">
+                    <Totales ARS={consumo.ARS + imp.ARS} USD={consumo.USD + imp.USD} />
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    consumos <Totales {...consumo} /> · impuestos {formatear(imp.ARS, "ARS")}
+                  </div>
+                </li>
+              );
+            })}
           {haySinAsignar && (
             <li className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm">
               <div className="font-medium">Sin asignar</div>
@@ -89,15 +111,20 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
         </ul>
       </section>
 
-      <section className="grid gap-3 sm:grid-cols-2">
-        <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
-          <div className="text-slate-500">Pago anterior y devoluciones</div>
-          <Totales {...validacion.totalPagos} />
-        </div>
-        <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
-          <div className="text-slate-500">Impuestos, intereses y percepciones</div>
-          <Totales {...validacion.totalImpuestos} />
-        </div>
+      <section className="space-y-2">
+        <h2 className="text-lg font-semibold">Impuestos, intereses y percepciones</h2>
+        <Impuestos
+          resumenId={resumen.id}
+          criterio={impuestos.criterio}
+          lineas={impuestos.lineas}
+          sinDetalle={impuestos.sinDetalle}
+          total={validacion.totalImpuestos}
+          porPersona={[...impuestos.porPersona].map(([personaId, t]) => ({ personaId, ...t }))}
+          personas={opciones}
+        />
+        <p className="text-sm text-slate-500">
+          Pago anterior y devoluciones (no se reparte): <Totales {...validacion.totalPagos} />
+        </p>
       </section>
 
       {tarjetas.map((t) => (
@@ -155,6 +182,9 @@ export default async function DetalleResumen({ params }: PageProps<"/resumenes/[
           </div>
         </section>
       ))}
+      <div className="flex justify-end">
+        <BorrarResumen resumenId={resumen.id} />
+      </div>
     </div>
   );
 }
